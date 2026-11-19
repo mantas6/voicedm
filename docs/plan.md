@@ -411,8 +411,7 @@ docs/
   and `ruff` from the locked environment.
 - **Wiring:** the NixOS configuration that hosts the app adds this flake as an input,
   imports `nixosModules.default`, enables the service and sets the two upstream URLs.
-  The repository is private, so the machine that builds that configuration needs read
-  access to it.
+  The repository is public, so the input is `github:mantas6/voicedm`.
 
 The app host can be CPU-only. Speech-to-text is the only model that runs in the voicedm
 process. If faster-whisper is too slow on the target CPU, use a smaller model or move the

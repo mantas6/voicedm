@@ -7,6 +7,33 @@ Created in [T3 Code](https://t3.codes).
 Self-hosted, hands-free voice conversation with a local LLM, in the browser. See
 [docs/plan.md](docs/plan.md) for the design.
 
+## Running without cloning (Nix)
+
+With Nix and flakes enabled, this builds and starts the server straight from GitHub.
+It needs a running [Ollama](https://ollama.com) with at least one model and a
+[Chatterbox TTS Server](https://github.com/devnen/Chatterbox-TTS-Server):
+
+```sh
+VOICEDM_OLLAMA_URL=http://localhost:11434 \
+VOICEDM_CHATTERBOX_URL=http://localhost:8004 \
+VOICEDM_DATA_DIR=~/.local/share/voicedm \
+nix run github:mantas6/voicedm
+```
+
+Then open <http://localhost:8780>, press **Call**, allow the microphone and talk.
+
+- The first build takes a few minutes; the first start downloads the Whisper model
+  (`base.en`, about 140 MB) into `VOICEDM_DATA_DIR`, which also holds the database.
+  Without `VOICEDM_DATA_DIR` it uses `./data` in the current directory.
+- `localhost` counts as a secure origin, so the microphone works there over plain
+  HTTP. From a phone or another computer it needs HTTPS in front, and the host's
+  firewall must let the call's UDP audio in; both are covered under
+  [Installing on NixOS](#installing-on-nixos).
+- All settings are `VOICEDM_*` environment variables, listed in the Configuration
+  section of the [plan](docs/plan.md). Check the upstreams with
+  `curl http://localhost:8780/api/health`.
+- To run it as a service instead, use the NixOS module below.
+
 ## Development
 
 Enter the dev shell (Python, `uv`, `ffmpeg`, `ruff`), or use your own `uv`:
@@ -63,7 +90,7 @@ Add the flake as an input of your system flake and import the module:
 
 ```nix
 {
-  inputs.voicedm.url = "git+ssh://git@example.org/you/voicedm.git"; # wherever it lives
+  inputs.voicedm.url = "github:mantas6/voicedm";
 
   outputs = { nixpkgs, voicedm, ... }: {
     nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
@@ -102,3 +129,7 @@ for a newer revision on each start; for a host without that access, point
   default ephemeral range, UDP 32768-60999. To limit that to the LAN, leave
   `openFirewall` off and open the same ports with
   `networking.firewall.interfaces.<lan>.allowedUDPPortRanges`.
+
+## License
+
+[MIT](LICENSE)

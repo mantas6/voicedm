@@ -26,6 +26,7 @@ let
     voicedm = prev.voicedm.overrideAttrs (old: {
       meta = (old.meta or { }) // {
         description = "Self-hosted, hands-free voice conversation with a local LLM in the browser";
+        license = lib.licenses.mit;
         mainProgram = "voicedm";
         platforms = lib.platforms.linux;
       };
