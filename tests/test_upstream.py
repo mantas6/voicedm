@@ -128,3 +128,26 @@ async def test_warm_up_times_out(monkeypatch):
     async with client:
         result = await asyncio.wait_for(ups.warm_up("m", "v"), timeout=2)
     assert result == {"ollama": False, "chatterbox": False}
+
+
+async def test_chat_returns_the_reply_text():
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.url.path, json.loads(request.content)))
+        reply = {"message": {"role": "assistant", "content": "A summary."}, "eval_count": 3}
+        return httpx.Response(200, json=reply)
+
+    ups, client = make(handler)
+    async with client:
+        messages = [{"role": "user", "content": "hi"}]
+        assert await ups.chat("m", messages, limit=5) == "A summary."
+    assert requests == [("/api/chat", {"model": "m", "messages": messages, "stream": False})]
+
+
+async def test_chat_failures_raise_upstream_error():
+    for response in (httpx.Response(500), httpx.Response(200, json={"error": "x"})):
+        ups, client = make(lambda request, r=response: r)
+        async with client:
+            with pytest.raises(UpstreamError):
+                await ups.chat("m", [], limit=5)

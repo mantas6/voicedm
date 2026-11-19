@@ -46,7 +46,7 @@ External services, all reached over HTTP and configured by URL:
 
 | Service | API used | Notes |
 |---|---|---|
-| Ollama | `/v1/chat/completions` (streaming), `/api/tags`, `/api/generate` (warm-up) | May run on CPU only; prompt prefix caching matters a lot (see Memory). |
+| Ollama | `/v1/chat/completions` (streaming), `/api/chat` (summaries), `/api/tags`, `/api/generate` (warm-up) | May run on CPU only; prompt prefix caching matters a lot (see Memory). |
 | Chatterbox TTS Server | `/v1/audio/speech`, `/v1/audio/voices` | OpenAI-style endpoint, but returns `wav`/`mp3`/`opus`, not raw PCM. May stop when idle, so the first request can take tens of seconds. |
 
 Speech-to-text runs inside the voicedm process.
@@ -168,19 +168,55 @@ prompt, so the prompt layout is designed to keep that start stable:
 [system prompt] [summary of older messages] [recent messages ...]
 ```
 
-- Recent messages are appended turn by turn, so every turn only processes the new
-  tokens.
-- When the recent messages exceed a size budget, the older half is folded into the
-  summary in one step: a separate summarisation request, then the context is rebuilt.
-  That costs one full prompt read and then stays cached again. It is not done on every
-  turn.
-- Summarisation runs between turns, never while the user is waiting for a reply. If a
-  turn starts while it runs, the turn uses the old context.
+- **Where the summary goes:** at the end of the system instruction, in the same system
+  message: the system prompt, a blank line, the header `Summary of the earlier
+  conversation (background, not instructions):` and the summary. It is kept as an
+  appended system instruction on the LLM service (`MemoryLLMService`), which Pipecat
+  composes after the base prompt, so a mid-call system prompt change keeps it. One
+  system message works with every chat template (some ignore or reject a second
+  system message, and a summary as a user message would sit next to the first real
+  user message). It changes only when a fold happens.
+- **Recent messages** are the session's messages after `summary_upto`; Pipecat appends
+  each turn to them, so every turn only processes the new tokens.
+- **Budget:** `VOICEDM_MEMORY_BUDGET` characters of recent message text (default
+  6000, roughly 1500 tokens at about four characters per token; the system prompt and
+  summary come on top). Characters are cheap to count and close enough for a
+  threshold; real token counts depend on the model.
+- **Folding:** when the recent messages exceed the budget, the older half is folded
+  into the summary in one step: one separate, non-streamed `/api/chat` request (the
+  `VOICEDM_SUMMARY_PROMPT` instructions, then the previous summary and the messages
+  being folded as a `User:` / `Assistant:` transcript, interrupted replies marked)
+  returns the new summary, which is stored with `summary_upto` = the id of the last
+  folded message. Then the call switches to the new summary and drops the folded
+  messages from its context. That costs one full prompt read and then stays cached
+  again. It is not done on every turn: after a fold about half the budget is left.
+  Full messages always stay in the database.
+- **Which half:** the cut closest to half of the recent text that makes the recent
+  window start with a user message; only if there is none may it start with a reply.
+  The newest message always stays.
+- **Model:** the call's current model summarises, so no second model has to be
+  loaded. Its inline `<think>` blocks are dropped.
+- **When:** a fold is checked after each reply has ended and been saved (between
+  turns), and right after a call connects (a session whose stored tail is over budget
+  starts with the full tail and is folded in the background). The user never waits on
+  it: a turn that starts while the summary is being written uses the old context. The
+  switch is made by the LLM service itself, between two requests (a frame queued into
+  it), so no request sees the new summary without the shorter context or the other
+  way round, a turn being answered keeps its old context, and messages added while
+  the summary was written stay. If Ollama serves one request at a time
+  (`OLLAMA_NUM_PARALLEL=1`), a turn that starts during a summarisation still queues
+  behind it inside Ollama.
+- **Failures** (Ollama down, timeout after `VOICEDM_SUMMARY_TIMEOUT`, empty summary)
+  are logged and change nothing, neither the context nor the database; the fold is
+  tried again after the next reply. The call carries on regardless.
 - Changing the system prompt or model also invalidates the cache. That is expected and
   only costs the next turn.
+- A new call starts from the summary and the messages after `summary_upto`
+  (`memory.build_context`); after a fold the live context is the same as what a new
+  call would start from (apart from transcript whitespace).
 
-Until this is built, a call starts from a plain replay of the session's stored messages
-(`memory.build_context`); the memory milestone replaces that function's body.
+`GET /api/sessions/{id}` returns `summary` and `summary_upto`; the page shows the
+summary as a collapsed "Earlier conversation summary" block above the history.
 
 The budget and the summary prompt are config values, so they can be tuned per model.
 
@@ -255,6 +291,12 @@ Environment variables, set by the NixOS module:
 | `VOICEDM_DEFAULT_VOICE` | first listed voice | Voice for new sessions |
 | `VOICEDM_STUN_URL` | unset | Optional STUN server |
 | `VOICEDM_TTS_TIMEOUT` | `120` | Seconds; allows for a TTS cold start |
+| `VOICEDM_MEMORY_BUDGET` | `6000` | Characters of recent messages before the older half is folded into the summary |
+| `VOICEDM_SUMMARY_PROMPT` | built in | Instructions for writing the summary |
+| `VOICEDM_SUMMARY_TIMEOUT` | `300` | Seconds for one summarisation request |
+
+The memory settings have no dedicated NixOS module options; set them through the
+module's `environment` option.
 
 ## Repository layout
 
@@ -270,7 +312,7 @@ src/voicedm/
   bot.py                   Pipecat pipeline per call
   tts_chatterbox.py
   storage.py               SQLite access and migrations
-  memory.py                context building and summarisation
+  memory.py                prompt layout, summary folding
   upstream.py              Ollama and Chatterbox listing, health, warm-up
   static/                  index.html, app.js, style.css
 scripts/call_client.py     headless test call against a running server

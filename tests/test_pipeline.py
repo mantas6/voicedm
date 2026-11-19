@@ -1,5 +1,5 @@
-"""The call pipeline with fake STT/LLM/TTS: turn persistence, interruptions, history
-and mid-call settings changes.
+"""The call pipeline with fake STT/LLM/TTS: turn persistence, interruptions, history,
+mid-call settings changes and summary folding.
 
 The pipeline is the real one minus the transport and speech-to-text: the real context
 aggregators with the bot's turn recorder, an Ollama LLM service whose completion is
@@ -37,7 +37,7 @@ from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
 
 from voicedm.bot import TurnRecorder, settings_frames
-from voicedm.memory import build_context
+from voicedm.memory import SUMMARY_HEADER, CallMemory, MemoryLLMService, build_context
 from voicedm.storage import Storage
 from voicedm.tts_chatterbox import ChatterboxTTSService
 
@@ -52,8 +52,8 @@ async def eventually(check) -> None:
             await asyncio.sleep(0.01)
 
 
-class ScriptedLLM(OLLamaLLMService):
-    """Ollama service that answers from a script instead of the network.
+class ScriptedLLM(MemoryLLMService):
+    """The call's LLM service, answering from a script instead of the network.
 
     Each reply is a list of text chunks; an ``asyncio.Event`` in it holds the reply
     there until set (or until an interruption cancels it). Records the model, system
@@ -113,13 +113,23 @@ def wav_bytes(seconds: float = SENTENCE_SECONDS, rate: int = 24000) -> bytes:
 class Call:
     """One pipeline run against a session, with helpers to act as the user."""
 
-    def __init__(self, store: Storage, session: dict, history: list[dict], replies) -> None:
+    def __init__(
+        self,
+        store: Storage,
+        session: dict,
+        history: list[dict],
+        replies,
+        *,
+        summarise=None,
+        budget: int = 6000,
+    ) -> None:
         self.store = store
         self.session_id = session["id"]
         self.tts_requests: list[dict] = []
         self.http = httpx.AsyncClient(transport=httpx.MockTransport(self._tts))
         self.llm = ScriptedLLM(
             replies,
+            summary=session["summary"],
             settings=OLLamaLLMService.Settings(
                 model=session["model"], system_instruction=session["system_prompt"]
             ),
@@ -127,15 +137,24 @@ class Call:
         self.tts = ChatterboxTTSService(
             base_url="http://tts.test", voice=session["voice"], client=self.http, timeout=2
         )
+        self.context = LLMContext(messages=build_context(session, history))
+        self.memory = CallMemory(
+            store, session, self.context, self.llm, summarise or self._no_summary, budget
+        )
         aggregators = LLMContextAggregatorPair(
-            LLMContext(messages=build_context(session, history)),
+            self.context,
             user_params=LLMUserAggregatorParams(
                 user_turn_strategies=UserTurnStrategies(
                     stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.05)]
                 ),
             ),
         )
-        TurnRecorder(store, self.session_id, lambda: self.llm.settings.model).attach(aggregators)
+        TurnRecorder(
+            store,
+            self.session_id,
+            lambda: self.llm.settings.model,
+            after_reply=self.memory.request_fold,
+        ).attach(aggregators)
         pipeline = Pipeline(
             [aggregators.user(), self.llm, self.tts, PlaybackOutput(), aggregators.assistant()]
         )
@@ -147,6 +166,10 @@ class Call:
         )
         self.runner = WorkerRunner(handle_sigint=False)
         self._run: asyncio.Task | None = None
+
+    @staticmethod
+    async def _no_summary(previous: str, messages: list[dict]) -> str:
+        raise AssertionError("no fold expected")
 
     def _tts(self, request: httpx.Request) -> httpx.Response:
         self.tts_requests.append(json.loads(request.content))
@@ -162,12 +185,14 @@ class Call:
         await self.runner.add_workers(self.worker)
         self._run = asyncio.create_task(self.runner.run())
         await asyncio.wait_for(started.wait(), TIMEOUT)
+        self.memory.request_fold()  # as the bot does once the client connects
         return self
 
     async def __aexit__(self, *exc) -> None:
         # Like a hang-up: the client disconnects and the worker is cancelled.
         await self.worker.cancel()
         await asyncio.wait_for(self._run, TIMEOUT)
+        await self.memory.close()
         await self.http.aclose()
 
     async def say(self, text: str) -> None:
@@ -317,3 +342,207 @@ def test_settings_frames_only_for_changed_services():
     assert len(settings_frames({"voice": "v"})) == 1
     assert len(settings_frames({"model": "m", "system_prompt": "p"})) == 1
     assert len(settings_frames({"model": "m", "voice": "v"})) == 2
+
+
+# -- summary memory --
+
+
+class Summariser:
+    """Records each summarisation request; answers "S1", "S2", ... once ``release`` is
+    set."""
+
+    def __init__(self, release: asyncio.Event | None = None) -> None:
+        self.calls: list[tuple[str, list[str]]] = []
+        self.release = release
+
+    async def __call__(self, previous: str, messages: list[dict]) -> str:
+        self.calls.append((previous, [m["content"] for m in messages]))
+        if self.release:
+            await self.release.wait()
+        return f"S{len(self.calls)}"
+
+
+def is_extension(longer: dict, shorter: dict) -> bool:
+    """Whether request ``longer`` starts with all of ``shorter`` (same system
+    instruction, same messages) and adds to it: what keeps Ollama's cache valid."""
+    n = len(shorter["messages"])
+    return (
+        longer["system"] == shorter["system"]
+        and longer["messages"][:n] == shorter["messages"]
+        and len(longer["messages"]) > n
+    )
+
+
+async def stored_summary(store: Storage, session_id: int) -> str:
+    return (await store.get_session(session_id))["summary"]
+
+
+async def test_fold_mid_call_between_turns_keeps_the_prefix_stable(store):
+    session = await store.create_session("model-a", "Alpha.wav", "Be brief.")
+    sid = session["id"]
+    summarise = Summariser()
+    replies = [["Answer one."], ["Answer two."], ["Three."], ["Four."]]
+    # 19 + 11 characters fit in the budget; the second exchange takes it to 61.
+    async with Call(store, session, [], replies, summarise=summarise, budget=60) as call:
+        await call.say("First question here")
+        await call.wait_for_messages(2)
+        await call.say("Second question here")
+        await call.wait_for_messages(4)
+
+        async def folded() -> bool:
+            return await stored_summary(store, sid) == "S1"
+
+        await eventually(folded)
+        await call.memory.wait()
+        await call.say("Third?")
+        await call.wait_for_messages(6)
+        await call.say("Fourth?")
+        messages = await call.wait_for_messages(8)
+
+    first, second, third, fourth = call.llm.requests
+    # No fold between the first two turns: the second request extends the first.
+    assert first["system"] == "Be brief."
+    assert is_extension(second, first)
+    # The older half (the first exchange) was folded into one summarisation request.
+    assert summarise.calls == [("", ["First question here", "Answer one."])]
+    assert third["system"] == f"Be brief.\n\n{SUMMARY_HEADER}\nS1"
+    assert [m["content"] for m in third["messages"]] == [
+        "Second question here",
+        "Answer two.",
+        "Third?",
+    ]
+    # And from there on, turns extend the prompt again.
+    assert is_extension(fourth, third)
+    # Nothing is deleted; the summary covers up to the first reply.
+    assert len(messages) == 8
+    stored = await store.get_session(sid)
+    assert (stored["summary"], stored["summary_upto"]) == ("S1", messages[1]["id"])
+
+
+async def test_fold_finishing_during_a_turn_switches_after_it(store):
+    session = await store.create_session("model-a", "Alpha.wav", "")
+    sid = session["id"]
+    await store.add_message(sid, "user", "Earlier question")
+    await store.add_message(sid, "assistant", "Earlier answer.", model="model-a")
+    history = await store.messages(sid)
+    release, hold = asyncio.Event(), asyncio.Event()
+    summarise = Summariser(release)
+    replies = [["Cats purr."], ["Dogs", hold, " bark."], ["Birds sing."]]
+    # 31 characters at the start fit; the first exchange takes it over 50.
+    async with Call(store, session, history, replies, summarise=summarise, budget=50) as call:
+        await call.say("Tell me about cats")
+        await call.wait_for_messages(4)
+
+        async def summarising() -> bool:
+            return bool(summarise.calls)
+
+        await eventually(summarising)
+        # The next turn starts while the summary is being written...
+        await call.say("And dogs?")
+
+        async def answering() -> bool:
+            return len(call.llm.requests) == 2
+
+        await eventually(answering)
+        # ...and the summary is stored while that turn is being answered.
+        release.set()
+
+        async def folded() -> bool:
+            return await stored_summary(store, sid) == "S1"
+
+        await eventually(folded)
+        assert (await store.get_session(sid))["summary_upto"] == history[1]["id"]
+        await asyncio.sleep(0.2)
+        # The turn in flight keeps the old context until its answer is done.
+        assert call.context.messages[0]["content"] == "Earlier question"
+        hold.set()
+        await call.wait_for_messages(6)
+        await call.memory.wait()
+        await call.say("And birds?")
+        messages = await call.wait_for_messages(8)
+
+    # (The last exchange takes the context over budget again, so a second fold may
+    # start as the call ends.)
+    assert summarise.calls[0] == ("", ["Earlier question", "Earlier answer."])
+    second, third = call.llm.requests[1:]
+    assert second["system"] is None
+    assert [m["content"] for m in second["messages"]] == [
+        "Earlier question",
+        "Earlier answer.",
+        "Tell me about cats",
+        "Cats purr.",
+        "And dogs?",
+    ]
+    # The turn that ran during the fold is not lost: its messages follow the kept ones.
+    assert third["system"] == f"{SUMMARY_HEADER}\nS1"
+    assert [m["content"] for m in third["messages"]] == [
+        "Tell me about cats",
+        "Cats purr.",
+        "And dogs?",
+        "Dogs bark.",
+        "And birds?",
+    ]
+    assert [m["content"] for m in messages][-4:] == [
+        "And dogs?",
+        "Dogs bark.",
+        "And birds?",
+        "Birds sing.",
+    ]
+
+
+async def test_call_starts_from_the_summary_and_the_messages_after_it(store):
+    session = await store.create_session("model-a", "Alpha.wav", "Be brief.")
+    sid = session["id"]
+    for role, text in [("user", "My cat is Tom."), ("assistant", "Nice."), ("user", "Hi again")]:
+        await store.add_message(sid, role, text, model="model-a" if role == "assistant" else None)
+    history = await store.messages(sid)
+    await store.set_summary(sid, "The user's cat is called Tom.", history[1]["id"])
+    session = await store.get_session(sid)
+    async with Call(store, session, history, [["Hello."]]) as call:
+        await call.say("What is my cat called?")
+        await call.wait_for_messages(5)
+    request = call.llm.requests[0]
+    assert request["system"] == f"Be brief.\n\n{SUMMARY_HEADER}\nThe user's cat is called Tom."
+    # Two user messages in a row (a reply that was never spoken) are replayed as they are.
+    assert request["messages"] == [
+        {"role": "user", "content": "Hi again"},
+        {"role": "user", "content": "What is my cat called?"},
+    ]
+
+
+async def test_over_budget_session_is_folded_after_connect(store):
+    session = await store.create_session("model-a", "Alpha.wav", "")
+    sid = session["id"]
+    for i in range(3):
+        await store.add_message(sid, "user", f"Question number {i}")
+        await store.add_message(sid, "assistant", f"Answer number {i}.", model="model-a")
+    history = await store.messages(sid)
+    summarise = Summariser()
+    async with Call(store, session, history, [["Yes."]], summarise=summarise, budget=80) as call:
+        await call.memory.wait()
+        await call.say("Still there?")
+        await call.wait_for_messages(8)
+    assert summarise.calls == [
+        ("", ["Question number 0", "Answer number 0.", "Question number 1", "Answer number 1."])
+    ]
+    assert [m["content"] for m in call.llm.requests[0]["messages"]] == [
+        "Question number 2",
+        "Answer number 2.",
+        "Still there?",
+    ]
+
+
+async def test_settings_change_keeps_the_summary(store):
+    session = await store.create_session("model-a", "Alpha.wav", "Old prompt.")
+    await store.set_summary(session["id"], "Earlier things.", 0)
+    session = await store.get_session(session["id"])
+    async with Call(store, session, [], [["One."], ["Two."]]) as call:
+        await call.say("First")
+        await call.wait_for_messages(2)
+        await call.worker.queue_frames(settings_frames({"system_prompt": "New prompt."}))
+        await call.say("Second")
+        await call.wait_for_messages(4)
+    assert [r["system"] for r in call.llm.requests] == [
+        f"Old prompt.\n\n{SUMMARY_HEADER}\nEarlier things.",
+        f"New prompt.\n\n{SUMMARY_HEADER}\nEarlier things.",
+    ]

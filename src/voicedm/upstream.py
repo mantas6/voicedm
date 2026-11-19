@@ -107,6 +107,32 @@ class Upstreams:
             raise UpstreamError("Chatterbox lists no voices")
         return voices[0]
 
+    async def chat(self, model: str, messages: list[dict[str, str]], limit: float) -> str:
+        """A one-off chat completion on Ollama's native API, not streamed; the reply text.
+
+        Used for side requests such as summarisation, apart from the call's own LLM.
+        ``limit`` bounds the whole request, in seconds.
+        """
+        url = f"{self.ollama_url}/api/chat"
+        body = {"model": model, "messages": messages, "stream": False}
+        reply = await self._request("POST", url, limit, json=body)
+        try:
+            content = reply["message"]["content"]
+        except (TypeError, KeyError) as e:
+            raise UpstreamError(f"unexpected /api/chat response: {e!r}") from e
+        if not isinstance(content, str):
+            raise UpstreamError("unexpected /api/chat response: content is not text")
+
+        def seconds(key: str) -> float:
+            return (reply.get(key) or 0) / 1e9  # Ollama reports nanoseconds
+
+        logger.info(
+            f"Ollama chat on {model}: {reply.get('prompt_eval_count')} prompt tokens in "
+            f"{seconds('prompt_eval_duration'):.1f}s, {reply.get('eval_count')} reply tokens "
+            f"in {seconds('eval_duration'):.1f}s, {seconds('total_duration'):.1f}s in total"
+        )
+        return content
+
     async def warm_up_ollama(self, model: str) -> None:
         """Load ``model`` into memory: a generate request without a prompt does only that."""
         url = f"{self.ollama_url}/api/generate"

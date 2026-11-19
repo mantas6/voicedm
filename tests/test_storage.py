@@ -148,3 +148,18 @@ async def test_update_session(store):
     assert await store.update_session(999, model="x") is None
     with pytest.raises(ValueError):
         await store.update_session(session["id"], summary="no")
+
+
+async def test_summary_and_messages_after_it(store):
+    session = await store.create_session("m", "v", "p")
+    sid = session["id"]
+    assert (session["summary"], session["summary_upto"]) == ("", None)
+    ids = [(await store.add_message(sid, "user", f"m{i}"))["id"] for i in range(4)]
+    before = (await store.get_session(sid))["updated_at"]
+    await store.set_summary(sid, "Talked about m0 and m1.", ids[1])
+    stored = await store.get_session(sid)
+    assert (stored["summary"], stored["summary_upto"]) == ("Talked about m0 and m1.", ids[1])
+    assert stored["updated_at"] == before  # summarising is not using the session
+    assert [m["content"] for m in await store.messages(sid, after=ids[1])] == ["m2", "m3"]
+    assert len(await store.messages(sid)) == 4  # folded messages stay
+    assert len(await store.messages(sid, after=None)) == 4

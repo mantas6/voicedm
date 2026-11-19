@@ -1,6 +1,8 @@
 from pathlib import Path
 
-from voicedm.config import Config
+import pytest
+
+from voicedm.config import DEFAULT_SUMMARY_PROMPT, Config
 
 
 def test_defaults():
@@ -15,6 +17,9 @@ def test_defaults():
     assert config.default_voice is None
     assert config.stun_url is None
     assert config.tts_timeout == 120.0
+    assert config.memory_budget == 6000
+    assert config.summary_prompt == DEFAULT_SUMMARY_PROMPT
+    assert config.summary_timeout == 300.0
 
 
 def test_overrides():
@@ -30,6 +35,9 @@ def test_overrides():
             "VOICEDM_DEFAULT_VOICE": "example-voice.wav",
             "VOICEDM_STUN_URL": "stun:stun.example:3478",
             "VOICEDM_TTS_TIMEOUT": "30.5",
+            "VOICEDM_MEMORY_BUDGET": "800",
+            "VOICEDM_SUMMARY_PROMPT": "Summarise.",
+            "VOICEDM_SUMMARY_TIMEOUT": "60",
         }
     )
     assert config.host == "127.0.0.1"
@@ -42,9 +50,17 @@ def test_overrides():
     assert config.default_voice == "example-voice.wav"
     assert config.stun_url == "stun:stun.example:3478"
     assert config.tts_timeout == 30.5
+    assert config.memory_budget == 800
+    assert config.summary_prompt == "Summarise."
+    assert config.summary_timeout == 60.0
 
 
 def test_empty_values_fall_back_to_defaults():
     config = Config.from_env({"VOICEDM_PORT": "", "VOICEDM_STUN_URL": "  "})
     assert config.port == 8780
     assert config.stun_url is None
+
+
+def test_memory_budget_must_be_positive():
+    with pytest.raises(ValueError):
+        Config.from_env({"VOICEDM_MEMORY_BUDGET": "0"})

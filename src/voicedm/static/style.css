@@ -275,6 +275,24 @@ textarea {
   text-align: center;
 }
 
+.memory {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.memory summary {
+  cursor: pointer;
+}
+
+.memory p {
+  margin: 0.4rem 0 0;
+  padding: 0.5rem 0.75rem;
+  border-left: 2px solid var(--border);
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .message {
   max-width: min(36rem, 85%);
   padding: 0.55rem 0.8rem;

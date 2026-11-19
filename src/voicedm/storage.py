@@ -169,9 +169,10 @@ class Storage:
 
     # -- messages --
 
-    def _messages(self, session_id: int) -> list[dict]:
+    def _messages(self, session_id: int, after: int | None) -> list[dict]:
         rows = self._conn.execute(
-            "SELECT * FROM messages WHERE session_id = ? ORDER BY id", (session_id,)
+            "SELECT * FROM messages WHERE session_id = ? AND id > ? ORDER BY id",
+            (session_id, after or 0),
         )
         return [{**dict(row), "interrupted": bool(row["interrupted"])} for row in rows]
 
@@ -200,9 +201,24 @@ class Storage:
         message = dict(row.fetchone())
         return {**message, "interrupted": bool(message["interrupted"])}
 
-    async def messages(self, session_id: int) -> list[dict]:
-        """A session's messages, oldest first."""
-        return await self._run(self._messages, session_id)
+    async def messages(self, session_id: int, after: int | None = None) -> list[dict]:
+        """A session's messages, oldest first; only those with an id above ``after`` if
+        given (e.g. the ones not folded into the summary yet)."""
+        return await self._run(self._messages, session_id, after)
+
+    async def set_summary(self, session_id: int, summary: str, upto: int) -> None:
+        """Store a session's summary of its messages up to and including id ``upto``.
+
+        The messages themselves stay; the summary does not count as using the session.
+        """
+
+        def update() -> None:
+            self._conn.execute(
+                "UPDATE sessions SET summary = ?, summary_upto = ? WHERE id = ?",
+                (summary, upto, session_id),
+            )
+
+        await self._run(update)
 
     async def add_message(
         self,

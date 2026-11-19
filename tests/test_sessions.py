@@ -80,6 +80,18 @@ def test_get_session_with_messages():
     ]
     assert listed[0]["message_count"] == 2
     assert "messages" not in listed[0]
+    assert (body["summary"], body["summary_upto"]) == ("", None)
+
+
+def test_get_session_shows_the_summary():
+    with client_for() as client:
+        session = client.post("/api/sessions").json()
+        store = client.app.state.store
+        first = client.portal.call(store.add_message, session["id"], "user", "My name is Sam")
+        client.portal.call(store.set_summary, session["id"], "The user is Sam.", first["id"])
+        body = client.get(f"/api/sessions/{session['id']}").json()
+    assert (body["summary"], body["summary_upto"]) == ("The user is Sam.", first["id"])
+    assert [m["content"] for m in body["messages"]] == ["My name is Sam"]  # still listed
 
 
 def test_unknown_session_is_not_found():

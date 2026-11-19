@@ -237,12 +237,23 @@ function renderTranscript() {
     els.transcript.append(hint);
     return;
   }
+  if (state.session?.summary) els.transcript.append(summaryNode(state.session.summary));
   for (const m of messages) {
     els.transcript.append(
       messageNode(m.role, m.content, { interrupted: m.interrupted, model: m.model }),
     );
   }
   scrollTranscript();
+}
+
+// What the bot remembers of the messages folded out of its context; the messages
+// themselves are all still listed.
+function summaryNode(text) {
+  const item = el("li", "memory");
+  const details = el("details");
+  details.append(el("summary", null, "Earlier conversation summary"), el("p", null, text));
+  item.append(details);
+  return item;
 }
 
 function scrollTranscript() {

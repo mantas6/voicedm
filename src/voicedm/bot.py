@@ -47,7 +47,7 @@ from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
 
 from voicedm.config import Config
-from voicedm.memory import build_context
+from voicedm.memory import CallMemory, MemoryLLMService, build_context, ollama_summariser
 from voicedm.storage import Storage
 from voicedm.tts_chatterbox import ChatterboxTTSService
 from voicedm.upstream import Upstreams
@@ -130,13 +130,21 @@ class TurnRecorder:
     it wrote to the context, the assistant aggregator the reply as far as it was
     spoken (it sits after the output transport, which releases text as its audio
     plays) and whether it was interrupted. Event handlers run as separate tasks, so
-    a lock keeps the writes in the order the turns finished.
+    a lock keeps the writes in the order the turns finished. ``after_reply`` is called
+    once each reply has ended and been saved: between turns.
     """
 
-    def __init__(self, store: Storage, session_id: int, llm_model: Callable[[], str]) -> None:
+    def __init__(
+        self,
+        store: Storage,
+        session_id: int,
+        llm_model: Callable[[], str],
+        after_reply: Callable[[], None] | None = None,
+    ) -> None:
         self.store = store
         self.session_id = session_id
         self._llm_model = llm_model
+        self._after_reply = after_reply
         self._reply_model: str | None = None
         self._lock = asyncio.Lock()
 
@@ -156,6 +164,8 @@ class TurnRecorder:
         async def on_assistant_turn(aggregator, message: AssistantTurnStoppedMessage) -> None:
             model = self._reply_model or self._llm_model()
             await self._save("assistant", message.content, model, message.interrupted)
+            if self._after_reply:
+                self._after_reply()
 
     async def _save(
         self, role: str, content: str, model: str | None = None, interrupted: bool = False
@@ -232,9 +242,11 @@ class Bot:
             raise RuntimeError(f"session {call.session_id} does not exist")
         history = await store.messages(call.session_id)
         model, voice = session["model"], session["voice"]
+        context = LLMContext(messages=build_context(session, history))
         logger.info(
             f"Call {connection.pc_id} on session {call.session_id}: model {model}, "
-            f"voice {voice}, {len(history)} earlier messages"
+            f"voice {voice}, {len(history)} earlier messages, {len(context.messages)} of "
+            f"them after the summary ({len(session['summary'])} characters)"
         )
 
         transport = SmallWebRTCTransport(
@@ -245,7 +257,9 @@ class Bot:
             whisper=self.whisper,
             settings=WhisperSTTService.Settings(model=config.whisper_model, language=Language.EN),
         )
-        llm = OLLamaLLMService(
+        # The system instruction is the session's system prompt plus its summary.
+        llm = MemoryLLMService(
+            summary=session["summary"],
             base_url=f"{config.ollama_url}/v1",
             settings=OLLamaLLMService.Settings(
                 model=model, system_instruction=session["system_prompt"]
@@ -257,7 +271,6 @@ class Bot:
             client=upstreams.client,
             timeout=config.tts_timeout,
         )
-        context = LLMContext(messages=build_context(session, history))
         aggregators = LLMContextAggregatorPair(
             context,
             user_params=LLMUserAggregatorParams(
@@ -266,7 +279,14 @@ class Bot:
                 user_turn_strategies=UserTurnStrategies(stop=[SpeechTimeoutUserTurnStopStrategy()]),
             ),
         )
-        TurnRecorder(store, call.session_id, lambda: llm.settings.model).attach(aggregators)
+        # Summarises with the call's current model, so no second model gets loaded.
+        summarise = ollama_summariser(
+            upstreams, lambda: llm.settings.model, config.summary_prompt, config.summary_timeout
+        )
+        memory = CallMemory(store, session, context, llm, summarise, config.memory_budget)
+        TurnRecorder(
+            store, call.session_id, lambda: llm.settings.model, after_reply=memory.request_fold
+        ).attach(aggregators)
 
         pipeline = Pipeline(
             [
@@ -314,6 +334,9 @@ class Bot:
         async def on_client_connected(transport, client) -> None:
             nonlocal warmup
             warmup = asyncio.create_task(warm_up())
+            # A session whose stored tail is over budget is folded now, in the
+            # background; turns before it finishes use the full tail.
+            memory.request_fold()
 
         @transport.event_handler("on_client_disconnected")
         async def on_client_disconnected(transport, client) -> None:
@@ -328,5 +351,6 @@ class Bot:
             call.detach()
             if warmup and not warmup.done():
                 warmup.cancel()
+            await memory.close()
             await connection.disconnect()
             logger.info(f"Call {connection.pc_id} ended")
