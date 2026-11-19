@@ -253,7 +253,7 @@ The budget and the summary prompt are config values, so they can be tuned per mo
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/` | Page (static files) |
+| `GET` | `/` | Page (static files; the browser re-checks them on every load, so an update shows up at once) |
 | `GET` | `/api/models` | Installed Ollama models |
 | `GET` | `/api/voices` | Chatterbox voices |
 | `GET` | `/api/sessions` | List sessions |

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -18,6 +20,10 @@ from pipecat.transports.smallwebrtc.request_handler import (
     SmallWebRTCRequestHandler,
 )
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.datastructures import Headers
+from starlette.responses import FileResponse, Response
+from starlette.staticfiles import NotModifiedResponse
+from starlette.types import Scope
 
 from voicedm import __version__
 from voicedm.config import DEFAULT_SYSTEM_PROMPT, Config
@@ -25,6 +31,34 @@ from voicedm.storage import Storage
 from voicedm.upstream import CHATTERBOX, OLLAMA, UpstreamError, Upstreams, explain
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+
+class PageFiles(StaticFiles):
+    """Static files that a browser checks for a new version on every load.
+
+    Left to itself a browser decides from a file's modification time how long to keep
+    using its copy, and tells versions apart by modification time and size. An
+    installed package can give every file the same, very old modification time in
+    every version, and the browser then keeps showing the old page after an update.
+    So the browser is told to ask each time, and a file is identified by its content.
+    """
+
+    def file_response(
+        self,
+        full_path: str | os.PathLike[str],
+        stat_result: os.stat_result,
+        scope: Scope,
+        status_code: int = 200,
+    ) -> Response:
+        response = FileResponse(full_path, status_code=status_code, stat_result=stat_result)
+        digest = hashlib.sha256(Path(full_path).read_bytes()).hexdigest()
+        response.headers["etag"] = f'"{digest[:32]}"'
+        response.headers["cache-control"] = "no-cache"
+        del response.headers["last-modified"]
+        if self.is_not_modified(response.headers, Headers(scope=scope)):
+            return NotModifiedResponse(response.headers)
+        return response
+
 
 SettingsHandler = Callable[[dict[str, str]], Awaitable[None]]
 # (reason, message for the page, whether the page should call again)
@@ -361,5 +395,5 @@ def create_app(
             "session_id": session_id,
         }
 
-    app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
+    app.mount("/", PageFiles(directory=STATIC_DIR, html=True), name="static")
     return app
