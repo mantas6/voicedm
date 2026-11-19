@@ -4,28 +4,32 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Coroutine
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import openai
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
-    BotStoppedSpeakingFrame,
+    CancelFrame,
+    EndFrame,
+    ErrorFrame,
     Frame,
-    InterruptionFrame,
+    InputAudioRawFrame,
     LLMFullResponseEndFrame,
     LLMTextFrame,
     LLMUpdateSettingsFrame,
+    MetricsFrame,
     TranscriptionFrame,
-    TTSAudioRawFrame,
     TTSUpdateSettingsFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
+from pipecat.metrics.metrics import TTFBMetricsData
 from pipecat.observers.base_observer import BaseObserver, FramePushed
-from pipecat.observers.loggers.metrics_log_observer import MetricsLogObserver
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -35,7 +39,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMUserAggregatorParams,
     UserTurnMessageAddedMessage,
 )
-from pipecat.processors.frame_processor import FrameDirection
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.ollama.llm import OLLamaLLMService
 from pipecat.services.whisper.stt import WhisperSTTService
 from pipecat.transcriptions.language import Language
@@ -50,7 +54,7 @@ from voicedm.config import Config
 from voicedm.memory import CallMemory, MemoryLLMService, build_context, ollama_summariser
 from voicedm.storage import Storage
 from voicedm.tts_chatterbox import ChatterboxTTSService
-from voicedm.upstream import Upstreams
+from voicedm.upstream import OLLAMA, UpstreamError, Upstreams, explain
 
 if TYPE_CHECKING:
     from faster_whisper import WhisperModel
@@ -59,6 +63,14 @@ if TYPE_CHECKING:
 
 IN_SAMPLE_RATE = 16000  # what Silero and Whisper read
 OUT_SAMPLE_RATE = 24000  # what Chatterbox produces
+
+# Seconds for the client to connect once it has the answer to its offer.
+CONNECT_TIMEOUT = 30.0
+# Seconds without any audio from the client after which its connection counts as gone.
+# A browser sends audio packets continuously, muted or not.
+SILENCE_TIMEOUT = 10.0
+# Seconds for a last message to the page to go out before the server ends a call.
+END_MESSAGE_GRACE = 0.3
 
 
 class SharedWhisperSTTService(WhisperSTTService):
@@ -72,55 +84,142 @@ class SharedWhisperSTTService(WhisperSTTService):
         self._model = self._shared_model
 
 
-class TurnTimingObserver(BaseObserver):
-    """Logs when each step of a turn happens, relative to the end of the user's speech.
+@dataclass
+class _Turn:
+    number: int
+    speech_end: float | None = None  # the last time the VAD heard the user stop
+    replying: bool = False  # the user's turn has ended and the reply is under way
+    marks: dict[str, float] = field(default_factory=dict)  # event -> monotonic time
+    ttfb: dict[str, float] = field(default_factory=dict)  # service -> seconds
 
-    Shows where latency goes and whether speech starts before the LLM has finished.
+
+class TurnTimingObserver(BaseObserver):
+    """Logs one line per turn: where the time from the end of the user's speech to
+    the bot's first audio went.
+
+    Times are seconds after the end of the user's speech as the VAD reports it
+    (which is itself the VAD's stop delay after the user fell silent):
+
+    - ``transcript``: the transcript arrived; ``turn_end``: the user's turn was
+      declared over and the reply started;
+    - ``first_text``: the first text the LLM produced (for a model that reasons
+      first, much later than its time to first byte);
+    - ``first_audio``: the bot's first audio started playing (the headline number);
+    - ``llm_end``: the LLM finished its reply;
+    - ``ttfb_stt``, ``ttfb_llm``, ``ttfb_tts``: Pipecat's time-to-first-byte metric
+      of each service for this turn (TTS: its first sentence).
+
+    A turn ends when its reply has been played to the end, or when the user starts
+    the next turn (``interrupted`` if a reply was under way then), or with the call.
+    What the interrupted reply's services report after that is not counted again.
     """
 
-    # Each logged once per reply, the first time it happens.
-    EVENTS: dict[type, str] = {
-        LLMTextFrame: "llm first token",
-        TTSAudioRawFrame: "tts first audio",
-        BotStartedSpeakingFrame: "bot started speaking",
-        LLMFullResponseEndFrame: "llm end",
-        BotStoppedSpeakingFrame: "bot stopped speaking",
-    }
+    MARKS = ("transcript", "turn_end", "first_text", "first_audio", "llm_end")
+
+    def __init__(
+        self,
+        services: dict[str, FrameProcessor],
+        output: FrameProcessor,
+        label: str = "",
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        super().__init__()
+        self._clock = clock
+        self._roles = {processor.name: role for role, processor in services.items()}
+        self._output = output
+        self._label = label
+        self._count = 0
+        self._turn: _Turn | None = None
+        self.turns: list[dict] = []  # what was logged, for tests
+
+    async def on_push_frame(self, data: FramePushed) -> None:
+        if data.direction != FrameDirection.DOWNSTREAM:
+            return
+        frame, now, turn = data.frame, self._clock(), self._turn
+        # The reply's end, once the output transport has played everything before it.
+        if isinstance(frame, LLMFullResponseEndFrame) and data.source is self._output:
+            if turn and turn.replying:
+                self._finish(interrupted=False)
+            return
+        # Broadcast frames travel both ways as two frames; count the downstream one,
+        # where it is first pushed.
+        if not data.first_push:
+            return
+        if isinstance(frame, UserStartedSpeakingFrame):
+            # A reply still under way is interrupted; speech that ended no turn
+            # (and got no reply) is not a turn to report.
+            if turn and turn.replying:
+                self._finish(interrupted=True)
+            self._count += 1
+            self._turn = _Turn(self._count)
+        elif isinstance(frame, (EndFrame, CancelFrame)):
+            if turn and turn.replying:
+                self._finish(interrupted=True)
+        elif turn is None:
+            return
+        elif not turn.replying:
+            if isinstance(frame, VADUserStoppedSpeakingFrame):
+                turn.speech_end = now
+            elif isinstance(frame, TranscriptionFrame):
+                turn.marks["transcript"] = now
+            elif isinstance(frame, UserStoppedSpeakingFrame):
+                turn.replying = True
+                turn.marks["turn_end"] = now
+            elif isinstance(frame, MetricsFrame):
+                self._ttfb(turn, frame, ("stt",), latest=True)
+        elif isinstance(frame, LLMTextFrame):
+            turn.marks.setdefault("first_text", now)
+        elif isinstance(frame, BotStartedSpeakingFrame):
+            turn.marks.setdefault("first_audio", now)
+        elif isinstance(frame, LLMFullResponseEndFrame):
+            turn.marks.setdefault("llm_end", now)
+        elif isinstance(frame, MetricsFrame):
+            self._ttfb(turn, frame, ("llm", "tts"), latest=False)
+
+    def _ttfb(self, turn: _Turn, frame: MetricsFrame, roles: tuple, latest: bool) -> None:
+        for metric in frame.data:
+            role = self._roles.get(metric.processor)
+            fresh = latest or role not in turn.ttfb
+            if isinstance(metric, TTFBMetricsData) and role in roles and fresh:
+                turn.ttfb[role] = metric.value
+
+    def _finish(self, interrupted: bool) -> None:
+        turn, self._turn = self._turn, None
+        if turn is None:
+            return
+        base = turn.speech_end
+
+        def seconds(value: float | None) -> str:
+            return "-" if value is None else f"{value:.2f}"
+
+        values: dict[str, float | None] = {
+            name: (turn.marks[name] - base if base and name in turn.marks else None)
+            for name in self.MARKS
+        }
+        for role in ("stt", "llm", "tts"):
+            values[f"ttfb_{role}"] = turn.ttfb.get(role)
+        self.turns.append({"turn": turn.number, **values, "interrupted": interrupted})
+        fields = " ".join(f"{name}={seconds(value)}" for name, value in values.items())
+        logger.info(
+            f"Turn timing{self._label}: turn={turn.number} {fields} "
+            f"interrupted={'yes' if interrupted else 'no'}"
+        )
+
+
+class InputAudioWatch(BaseObserver):
+    """Remembers when audio last arrived from the client.
+
+    A browser sends audio packets all the time, even when muted (silence), so a
+    long gap means the connection is gone, whether or not WebRTC has noticed.
+    """
 
     def __init__(self) -> None:
         super().__init__()
-        self._turn = 0
-        self._speech_end: float | None = None
-        self._seen: set[str] = set()
+        self.last = time.monotonic()
 
     async def on_push_frame(self, data: FramePushed) -> None:
-        # Broadcast frames travel both ways as two frames; count the downstream one.
-        if not data.first_push or data.direction != FrameDirection.DOWNSTREAM:
-            return
-        frame, now = data.frame, time.monotonic()
-        if isinstance(frame, UserStartedSpeakingFrame):
-            self._turn += 1
-            self._seen.clear()
-            self._speech_end = None
-        elif isinstance(frame, VADUserStoppedSpeakingFrame):
-            self._speech_end = now
-        elif isinstance(frame, UserStoppedSpeakingFrame):
-            # The reply starts here; anything earlier is the tail of an interrupted one.
-            self._seen.clear()
-            self._log("user turn end", now)
-        elif isinstance(frame, InterruptionFrame):
-            self._log("interruption", now)
-        elif isinstance(frame, TranscriptionFrame):
-            self._log(f"transcript {frame.text.strip()!r}", now)
-        else:
-            for cls, name in self.EVENTS.items():
-                if isinstance(frame, cls) and name not in self._seen:
-                    self._seen.add(name)
-                    self._log(name, now)
-
-    def _log(self, event: str, now: float) -> None:
-        offset = f"+{now - self._speech_end:.2f}s" if self._speech_end else "-"
-        logger.info(f"turn {self._turn}: {event} at {offset} after end of speech")
+        if isinstance(data.frame, InputAudioRawFrame):
+            self.last = time.monotonic()
 
 
 class TurnRecorder:
@@ -140,11 +239,13 @@ class TurnRecorder:
         session_id: int,
         llm_model: Callable[[], str],
         after_reply: Callable[[], None] | None = None,
+        on_save_error: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self.store = store
         self.session_id = session_id
         self._llm_model = llm_model
         self._after_reply = after_reply
+        self._on_save_error = on_save_error
         self._reply_model: str | None = None
         self._lock = asyncio.Lock()
 
@@ -181,7 +282,10 @@ class TurnRecorder:
                     self.session_id, role, content, model=model, interrupted=interrupted
                 )
             except Exception:
-                logger.exception(f"Could not save a {role} message")
+                # The call goes on; the page is told the history has a gap.
+                logger.exception(f"Session {self.session_id}: could not save a {role} message")
+                if self._on_save_error:
+                    await self._on_save_error()
 
 
 def settings_frames(changes: dict[str, str]) -> list[Frame]:
@@ -215,6 +319,66 @@ def load_whisper(config: Config) -> WhisperModel:
     )
 
 
+def explain_llm_error(error: ErrorFrame, model: str) -> str:
+    """A message for the page about a failed LLM request."""
+    e = error.exception
+    if isinstance(e, openai.APITimeoutError | TimeoutError):
+        failure = UpstreamError(str(e), "timeout")
+    elif isinstance(e, openai.APIConnectionError):
+        failure = UpstreamError(str(e), "unreachable")
+    elif isinstance(e, openai.APIStatusError):
+        failure = UpstreamError(str(e), "status", e.status_code, getattr(e, "message", "")[:200])
+    else:
+        return f"The language model failed: {error.error}"
+    return explain(failure, OLLAMA, model)
+
+
+# Sentences in a row that the TTS service failed to speak before a call is ended.
+MAX_TTS_FAILURES = 3
+TTS_GAVE_UP = (
+    "Speech has stopped working, so the call was ended. Check the voice server "
+    "(Chatterbox) and call again."
+)
+
+
+class ErrorReporter:
+    """Turns the error frames that reach the pipeline worker into messages for the
+    page: ``report(service, message)``.
+
+    Speech that has stopped working ends the call (``give_up(message)``) rather than
+    leaving a bot that answers in silence: after ``MAX_TTS_FAILURES`` sentences in a
+    row failed, or once Pipecat has written the TTS service off for the rest of the
+    call (it adds its own error for each reply that got no audio, and does that after
+    a few in a row).
+    """
+
+    def __init__(
+        self,
+        llm: OLLamaLLMService,
+        tts: ChatterboxTTSService,
+        report: Callable[[str, str], None],
+        give_up: Callable[[str], None],
+    ) -> None:
+        self.llm = llm
+        self.tts = tts
+        self.report = report
+        self.give_up = give_up
+        self._gave_up = False
+
+    def handle(self, frame: ErrorFrame) -> None:
+        if frame.processor is self.tts:
+            if "completed with no audio" not in frame.error:
+                self.report("tts", frame.error)  # already a message for the page
+            failing = self.tts.failures_in_a_row >= MAX_TTS_FAILURES
+            if (failing or not self.tts.is_usable) and not self._gave_up:
+                self._gave_up = True
+                self.give_up(TTS_GAVE_UP)
+        elif frame.processor is self.llm:
+            self.report("llm", explain_llm_error(frame, self.llm.settings.model))
+        else:
+            self.report("other", f"Something went wrong: {frame.error}")
+
+
 class Bot:
     """Holds the models shared by all calls and runs one pipeline per call."""
 
@@ -233,10 +397,44 @@ class Bot:
         store: Storage,
         call: ActiveCall,
     ) -> None:
-        """Run the pipeline for one call on ``call.session_id`` until the client leaves."""
+        """Run the pipeline for one call on ``call.session_id`` until the call ends.
+
+        A call ends when the client hangs up or its connection is gone, when the
+        server ends it (``call.end``: shutdown, a replacing call, speech that has
+        stopped working), or when the client never connects. The connection is
+        closed however it ends, also if setting the pipeline up fails.
+        """
+        tasks: set[asyncio.Task] = set()
+        memory: CallMemory | None = None
+        try:
+            worker, memory = await self._prepare(connection, upstreams, store, call, tasks)
+            runner = WorkerRunner(handle_sigint=False)
+            await runner.add_workers(worker)
+            await runner.run()
+        finally:
+            call.detach()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if memory:
+                await memory.close()
+            await connection.disconnect()
+            logger.info(f"Call {connection.pc_id} ended")
+
+    async def _prepare(
+        self,
+        connection: SmallWebRTCConnection,
+        upstreams: Upstreams,
+        store: Storage,
+        call: ActiveCall,
+        tasks: set[asyncio.Task],
+    ) -> tuple[PipelineWorker, CallMemory]:
+        """Build the call's pipeline and hook up its events; ``tasks`` collects the
+        background tasks to cancel when the call ends."""
         if self.whisper is None:
             raise RuntimeError("Bot.load() has not run")
         config = self.config
+        pc_id = connection.pc_id
         session = await store.get_session(call.session_id)
         if session is None:
             raise RuntimeError(f"session {call.session_id} does not exist")
@@ -244,10 +442,24 @@ class Bot:
         model, voice = session["model"], session["voice"]
         context = LLMContext(messages=build_context(session, history))
         logger.info(
-            f"Call {connection.pc_id} on session {call.session_id}: model {model}, "
-            f"voice {voice}, {len(history)} earlier messages, {len(context.messages)} of "
-            f"them after the summary ({len(session['summary'])} characters)"
+            f"Call {pc_id} on session {call.session_id}: model {model}, voice {voice}, "
+            f"{len(history)} earlier messages, {len(context.messages)} of them after the "
+            f"summary ({len(session['summary'])} characters)"
         )
+
+        def background(coro: Coroutine) -> None:
+            task = asyncio.create_task(coro)
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+
+        def send(data: dict) -> None:
+            """A server message to the page, straight onto the data channel (queued
+            until it opens), so it is not held up behind the pipeline's frames."""
+            message = {"label": "rtvi-ai", "type": "server-message", "data": data}
+            connection.send_app_message(message)
+
+        def report(service: str, message: str) -> None:
+            send({"type": "error", "service": service, "message": message})
 
         transport = SmallWebRTCTransport(
             webrtc_connection=connection,
@@ -284,23 +496,33 @@ class Bot:
             upstreams, lambda: llm.settings.model, config.summary_prompt, config.summary_timeout
         )
         memory = CallMemory(store, session, context, llm, summarise, config.memory_budget)
+
+        async def save_failed() -> None:
+            report(
+                "storage",
+                "Could not save the conversation; the call goes on, but the history "
+                "may miss what was just said.",
+            )
+
         TurnRecorder(
-            store, call.session_id, lambda: llm.settings.model, after_reply=memory.request_fold
+            store,
+            call.session_id,
+            lambda: llm.settings.model,
+            after_reply=memory.request_fold,
+            on_save_error=save_failed,
         ).attach(aggregators)
 
+        output = transport.output()
         pipeline = Pipeline(
-            [
-                transport.input(),
-                stt,
-                aggregators.user(),
-                llm,
-                tts,
-                transport.output(),
-                aggregators.assistant(),
-            ]
+            [transport.input(), stt, aggregators.user(), llm, tts, output, aggregators.assistant()]
+        )
+        audio_in = InputAudioWatch()
+        timing = TurnTimingObserver(
+            {"stt": stt, "llm": llm, "tts": tts}, output, label=f" (session {call.session_id})"
         )
         # RTVI is added by the worker by default: transcripts and bot state go to the
-        # page over the data channel.
+        # page over the data channel. It also forwards error frames as raw RTVI
+        # "error" messages; the page shows the server's own messages instead.
         worker = PipelineWorker(
             pipeline,
             params=PipelineParams(
@@ -309,48 +531,100 @@ class Bot:
                 enable_metrics=True,
                 enable_usage_metrics=True,
             ),
-            observers=[MetricsLogObserver(), TurnTimingObserver()],
+            observers=[timing, audio_in],
             # A call ends when the client hangs up, not after a quiet spell.
             idle_timeout_secs=None,
         )
+        ending = False
+
+        async def end_call(reason: str, message: str | None = None, retry: bool = False) -> None:
+            """End the call from the server side, telling the page why first."""
+            nonlocal ending
+            if ending:
+                return
+            ending = True
+            logger.info(f"Call {pc_id}: ending ({reason})")
+            send({"type": "call-ended", "reason": reason, "message": message, "retry": retry})
+            await asyncio.sleep(END_MESSAGE_GRACE)  # let the message go out first
+            await worker.cancel(reason=reason)
 
         async def update_settings(changes: dict[str, str]) -> None:
             frames = settings_frames(changes)
             if frames:
-                logger.info(f"Call {connection.pc_id}: settings changed: {sorted(changes)}")
+                logger.info(f"Call {pc_id}: settings changed: {sorted(changes)}")
                 await worker.queue_frames(frames)
+            if "model" in changes:
+                # Pipecat writes the LLM service off after an error such as a missing
+                # model; a new model is a fresh start. Load it now rather than on the
+                # next turn.
+                await llm.set_usable(True)
+                background(warm_up({"ollama": changes["model"]}))
 
-        await call.attach(update_settings)
-        warmup: asyncio.Task | None = None
+        await call.attach(update_settings, end_call)
 
-        async def warm_up() -> None:
-            await worker.rtvi.send_server_message({"type": "warmup", "state": "warming"})
+        async def warm_up(targets: dict[str, str]) -> None:
+            """Warm the upstreams in ``targets`` (name -> model or voice), telling the
+            page which are still pending and, at the end, which failed and why."""
+            pending = set(targets)
+            errors: dict[str, str] = {}
+            send({"type": "warmup", "state": "warming", "pending": sorted(pending)})
             started = time.monotonic()
-            result = await upstreams.warm_up(llm.settings.model, tts.settings.voice)
+
+            async def one(name: str, what: str) -> None:
+                error = await upstreams.warm_up_one(name, what)
+                pending.discard(name)
+                if error:
+                    errors[name] = error
+                if pending:
+                    send({"type": "warmup", "state": "warming", "pending": sorted(pending)})
+
+            await asyncio.gather(*(one(name, what) for name, what in targets.items()))
+            result = {name: name not in errors for name in targets}
             logger.info(f"Warm-up finished in {time.monotonic() - started:.1f}s: {result}")
-            await worker.rtvi.send_server_message({"type": "warmup", "state": "done", **result})
+            send({"type": "warmup", "state": "done", **result, "errors": errors})
+
+        connected = asyncio.Event()
+
+        async def watch_connection() -> None:
+            """End a call whose client never connects, or whose audio stops coming:
+            WebRTC itself can take half a minute to notice a vanished peer."""
+            try:
+                await asyncio.wait_for(connected.wait(), CONNECT_TIMEOUT)
+            except TimeoutError:
+                logger.warning(f"Call {pc_id}: the client did not connect in {CONNECT_TIMEOUT:g}s")
+                await worker.cancel(reason="client never connected")
+                return
+            audio_in.last = time.monotonic()
+            while True:
+                await asyncio.sleep(1.0)
+                if time.monotonic() - audio_in.last > SILENCE_TIMEOUT:
+                    logger.warning(
+                        f"Call {pc_id}: no audio from the client for {SILENCE_TIMEOUT:g}s; "
+                        "the connection is gone"
+                    )
+                    await worker.cancel(reason="connection lost")
+                    return
+
+        errors = ErrorReporter(
+            llm, tts, report, lambda message: background(end_call("tts", message))
+        )
+
+        @worker.event_handler("on_pipeline_error")
+        async def on_pipeline_error(worker: PipelineWorker, frame: ErrorFrame) -> None:
+            errors.handle(frame)
 
         @transport.event_handler("on_client_connected")
         async def on_client_connected(transport, client) -> None:
-            nonlocal warmup
-            warmup = asyncio.create_task(warm_up())
+            connected.set()
+            background(warm_up({"ollama": llm.settings.model, "chatterbox": tts.settings.voice}))
             # A session whose stored tail is over budget is folded now, in the
             # background; turns before it finishes use the full tail.
             memory.request_fold()
 
         @transport.event_handler("on_client_disconnected")
         async def on_client_disconnected(transport, client) -> None:
-            logger.info(f"Call {connection.pc_id}: client disconnected")
-            await worker.cancel()
+            logger.info(f"Call {pc_id}: client disconnected")
+            await worker.cancel(reason="client disconnected")
 
-        try:
-            runner = WorkerRunner(handle_sigint=False)
-            await runner.add_workers(worker)
-            await runner.run()
-        finally:
-            call.detach()
-            if warmup and not warmup.done():
-                warmup.cancel()
-            await memory.close()
-            await connection.disconnect()
-            logger.info(f"Call {connection.pc_id} ended")
+        background(watch_connection())
+        return worker, memory

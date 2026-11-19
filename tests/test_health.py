@@ -34,7 +34,7 @@ def test_both_upstreams_up():
         return httpx.Response(404)
 
     body = get_health(handler)
-    assert body == {"status": "ok", "upstreams": {"ollama": True, "chatterbox": True}}
+    assert body == {"status": "ok", "upstreams": {"ollama": True, "chatterbox": True}, "call": None}
     assert sorted(seen) == ["http://ollama.test/api/tags", "http://tts.test/v1/audio/voices"]
 
 
@@ -43,7 +43,11 @@ def test_unreachable_upstreams_reported_down():
         raise httpx.ConnectError("connection refused", request=request)
 
     body = get_health(handler)
-    assert body == {"status": "ok", "upstreams": {"ollama": False, "chatterbox": False}}
+    assert body == {
+        "status": "ok",
+        "upstreams": {"ollama": False, "chatterbox": False},
+        "call": None,
+    }
 
 
 def test_error_status_reported_down():

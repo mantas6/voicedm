@@ -22,6 +22,8 @@ from pipecat.frames.frames import ErrorFrame, Frame, TTSAudioRawFrame
 from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import TTSService
 
+from voicedm.upstream import CHATTERBOX, UpstreamError, error_detail, explain
+
 SPEECH_PATH = "/v1/audio/speech"
 CHUNK_SECONDS = 0.2  # audio per yielded frame
 STOP_FRAME_MARGIN = 1.0  # seconds
@@ -92,12 +94,20 @@ class ChatterboxTTSService(TTSService):
         self._url = f"{base_url.rstrip('/')}{SPEECH_PATH}"
         self._client = client
         self._timeout = timeout
+        # Sentences that failed since the last one that was spoken. Counted here
+        # because Pipecat's own count of replies without audio only moves once a
+        # reply's audio context times out, which is ``stop_frame_timeout_s`` later.
+        self.failures_in_a_row = 0
 
     def can_generate_metrics(self) -> bool:
         return True
 
     async def synthesize(self, text: str) -> PcmAudio:
-        """Fetch and parse the WAV for ``text``. Raises on any failure."""
+        """Fetch and parse the WAV for ``text``.
+
+        Raises ``UpstreamError`` if the request fails and ``WavError`` if the audio
+        cannot be used.
+        """
         body = {
             "model": self._settings.model,
             "input": text,
@@ -105,25 +115,39 @@ class ChatterboxTTSService(TTSService):
             "response_format": "wav",
         }
         # httpx timeouts apply per phase; asyncio.timeout bounds the whole request.
-        async with asyncio.timeout(self._timeout):
-            response = await self._client.post(self._url, json=body, timeout=self._timeout)
+        try:
+            async with asyncio.timeout(self._timeout):
+                response = await self._client.post(self._url, json=body, timeout=self._timeout)
+        except TimeoutError as e:
+            raise UpstreamError(f"timed out after {self._timeout:g}s", "timeout") from e
+        except httpx.TimeoutException as e:
+            raise UpstreamError(f"timed out: {e!r}", "timeout") from e
+        except httpx.HTTPError as e:
+            raise UpstreamError(f"request failed: {e!r}", "unreachable") from e
         if not response.is_success:
-            detail = response.text[:200].strip()
-            raise RuntimeError(f"Chatterbox HTTP {response.status_code}: {detail}")
+            status, detail = response.status_code, error_detail(response)
+            raise UpstreamError(f"HTTP {status}: {detail}", "status", status, detail)
         return parse_wav(response.content)
 
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
+        # The error frames carry a message for the page; the details go to the log.
+        # They have no exception attached, so Pipecat does not classify them as
+        # permanent: one failed sentence does not write the service off.
         try:
             audio = await self.synthesize(text)
-        except TimeoutError:
-            yield ErrorFrame(error=f"Chatterbox TTS timed out after {self._timeout:g}s")
+        except UpstreamError as e:
+            self.failures_in_a_row += 1
+            logger.warning(f"{self}: Chatterbox TTS failed: {e}")
+            yield ErrorFrame(error=explain(e, CHATTERBOX, self._settings.voice))
             return
-        except httpx.HTTPError as e:
-            yield ErrorFrame(error=f"Chatterbox TTS request failed: {e!r}")
+        except WavError as e:
+            self.failures_in_a_row += 1
+            logger.warning(f"{self}: Chatterbox TTS returned unusable audio: {e}")
+            yield ErrorFrame(
+                error="The voice server (Chatterbox) sent audio that could not be played."
+            )
             return
-        except (RuntimeError, WavError) as e:
-            yield ErrorFrame(error=f"Chatterbox TTS failed: {e}")
-            return
+        self.failures_in_a_row = 0
 
         await self.stop_ttfb_metrics()
         await self.start_tts_usage_metrics(text)

@@ -15,8 +15,57 @@ OLLAMA_WARMUP_TIMEOUT = 300.0
 WARMUP_TEXT = "Hi."
 
 
+OLLAMA = "the language model server (Ollama)"
+CHATTERBOX = "the voice server (Chatterbox)"
+
+
 class UpstreamError(RuntimeError):
-    """An upstream request failed or returned something unusable."""
+    """An upstream request failed or returned something unusable.
+
+    ``kind`` says how: ``unreachable`` (no connection), ``timeout``, ``status`` (an
+    HTTP error status, in ``status``, with the server's own message in ``detail``) or
+    ``invalid`` (an answer that could not be used) or ``empty`` (nothing installed).
+    """
+
+    def __init__(
+        self, message: str, kind: str = "invalid", status: int | None = None, detail: str = ""
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.status = status
+        self.detail = detail
+
+
+def error_detail(response: httpx.Response) -> str:
+    """The short reason an upstream gives in an error response, if any."""
+    try:
+        body = response.json()
+    except ValueError:
+        return response.text[:200].strip()
+    if isinstance(body, dict):
+        for key in ("error", "detail", "message"):
+            if isinstance(body.get(key), str):
+                return body[key][:200]
+    return ""
+
+
+def explain(error: UpstreamError, service: str, what: str = "") -> str:
+    """A message for the page about a failed request to ``service`` (``OLLAMA`` or
+    ``CHATTERBOX``). ``what`` names the model or voice the request was for."""
+    if error.kind == "unreachable":
+        return f"Cannot reach {service}."
+    if error.kind == "empty":
+        listed = "no models are installed" if service == OLLAMA else "no voices are offered"
+        return f"On {service}, {listed}."
+    if error.kind == "timeout":
+        return f"{service[0].upper()}{service[1:]} did not answer in time."
+    if error.kind == "status":
+        if error.status == 404 and what:
+            kind = "model" if service == OLLAMA else "voice"
+            return f"The {kind} “{what}” is not available on {service}. Pick another in Settings."
+        detail = f": {error.detail}" if error.detail else ""
+        return f"{service[0].upper()}{service[1:]} returned an error (HTTP {error.status}){detail}"
+    return f"{service[0].upper()}{service[1:]} sent an answer that could not be used."
 
 
 class Upstreams:
@@ -42,9 +91,17 @@ class Upstreams:
                 response = await self.client.request(method, url, timeout=limit, **kwargs)
                 response.raise_for_status()
         except TimeoutError as e:
-            raise UpstreamError(f"{method} {url}: timed out after {limit:g}s") from e
+            raise UpstreamError(f"{method} {url}: timed out after {limit:g}s", "timeout") from e
+        except httpx.HTTPStatusError as e:
+            status, detail = e.response.status_code, error_detail(e.response)
+            raise UpstreamError(
+                f"{method} {url}: HTTP {status}: {detail}", "status", status, detail
+            ) from e
+        except httpx.TransportError as e:
+            kind = "timeout" if isinstance(e, httpx.TimeoutException) else "unreachable"
+            raise UpstreamError(f"{method} {url}: {e!r}", kind) from e
         except httpx.HTTPError as e:
-            raise UpstreamError(f"{method} {url}: {e}") from e
+            raise UpstreamError(f"{method} {url}: {e!r}") from e
         if response.headers.get("content-type", "").startswith("application/json"):
             try:
                 return response.json()
@@ -95,7 +152,7 @@ class Upstreams:
             return preferred
         models = await self.list_models()
         if not models:
-            raise UpstreamError("Ollama has no models installed")
+            raise UpstreamError("Ollama has no models installed", "empty")
         return models[0]
 
     async def resolve_voice(self, preferred: str | None) -> str:
@@ -104,7 +161,7 @@ class Upstreams:
             return preferred
         voices = await self.list_voices()
         if not voices:
-            raise UpstreamError("Chatterbox lists no voices")
+            raise UpstreamError("Chatterbox lists no voices", "empty")
         return voices[0]
 
     async def chat(self, model: str, messages: list[dict[str, str]], limit: float) -> str:
@@ -146,19 +203,44 @@ class Upstreams:
         body = {"model": "chatterbox", "input": WARMUP_TEXT, "voice": voice}
         await self._request("POST", url, self.tts_timeout, json=body)
 
+    async def warm_up_one(self, name: str, what: str) -> str | None:
+        """Warm ``name`` ("ollama" with model ``what``, or "chatterbox" with voice
+        ``what``). None if it answered, else a message saying why not."""
+        try:
+            if name == "ollama":
+                await self.warm_up_ollama(what)
+            else:
+                await self.warm_up_chatterbox(what)
+        except UpstreamError as e:
+            logger.warning(f"Warm-up of {name} failed: {e}")
+            return explain(e, OLLAMA if name == "ollama" else CHATTERBOX, what)
+        return None
+
     async def warm_up(self, model: str, voice: str) -> dict[str, bool]:
         """Warm both services concurrently; report which ones answered."""
-
-        async def attempt(name: str, coro: Any) -> bool:
-            try:
-                await coro
-            except UpstreamError as e:
-                logger.warning(f"Warm-up of {name} failed: {e}")
-                return False
-            return True
-
         ollama, chatterbox = await asyncio.gather(
-            attempt("Ollama", self.warm_up_ollama(model)),
-            attempt("Chatterbox", self.warm_up_chatterbox(voice)),
+            self.warm_up_one("ollama", model), self.warm_up_one("chatterbox", voice)
         )
-        return {"ollama": ollama, "chatterbox": chatterbox}
+        return {"ollama": ollama is None, "chatterbox": chatterbox is None}
+
+    async def check_installed(self, model: str | None, voice: str | None) -> str | None:
+        """Whether ``model`` is installed in Ollama and ``voice`` offered by Chatterbox.
+
+        A message naming what is missing, or None. A service that cannot be asked
+        right now does not block the change: it is only checked when it answers.
+        """
+        checks = [
+            (model, self.list_models, "model", "Ollama"),
+            (voice, self.list_voices, "voice", "Chatterbox"),
+        ]
+        for value, listing, kind, service in checks:
+            if value is None:
+                continue
+            try:
+                available = await listing()
+            except UpstreamError as e:
+                logger.info(f"Not checking the {kind} {value!r}: {service} not available: {e}")
+                continue
+            if value not in available:
+                return f"The {kind} “{value}” is not available on {service}."
+        return None

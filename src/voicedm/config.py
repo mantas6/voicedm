@@ -43,6 +43,9 @@ class Config:
     memory_budget: int = 6000
     summary_prompt: str = DEFAULT_SUMMARY_PROMPT
     summary_timeout: float = 300.0
+    # Loguru level for the service's log; DEBUG adds Pipecat's per-frame detail
+    # (including conversation text).
+    log_level: str = "INFO"
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Config:
@@ -70,4 +73,5 @@ class Config:
             memory_budget=budget,
             summary_prompt=get("SUMMARY_PROMPT") or defaults.summary_prompt,
             summary_timeout=float(get("SUMMARY_TIMEOUT") or defaults.summary_timeout),
+            log_level=(get("LOG_LEVEL") or defaults.log_level).upper(),
         )

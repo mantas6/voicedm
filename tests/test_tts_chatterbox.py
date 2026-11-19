@@ -120,7 +120,7 @@ async def speak(handler, tts_timeout: float = 0.5):
         down, up = await run_test(tts, frames_to_send=[TTSSpeakFrame("Hello there.")])
     audio = [f for f in down if isinstance(f, TTSAudioRawFrame)]
     # Pipecat adds its own "context completed with no audio" error after ours.
-    errors = [f for f in up if isinstance(f, ErrorFrame) and "Chatterbox" in f.error]
+    errors = [f for f in up if isinstance(f, ErrorFrame) and "no audio" not in f.error]
     return audio, errors
 
 
@@ -165,7 +165,17 @@ async def test_http_error_becomes_error_frame():
     audio, errors = await speak(handler)
     assert not audio
     assert len(errors) == 1
-    assert "404" in errors[0].error and "voice not found" in errors[0].error
+    assert errors[0].error.startswith("The voice “example.wav” is not available")
+
+
+async def test_other_http_error_keeps_the_server_reason():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"detail": "out of memory"})
+
+    audio, errors = await speak(handler)
+    assert not audio
+    assert len(errors) == 1
+    assert "HTTP 500" in errors[0].error and "out of memory" in errors[0].error
 
 
 async def test_connection_error_becomes_error_frame():
@@ -175,7 +185,7 @@ async def test_connection_error_becomes_error_frame():
     audio, errors = await speak(handler)
     assert not audio
     assert len(errors) == 1
-    assert "ConnectError" in errors[0].error
+    assert errors[0].error == "Cannot reach the voice server (Chatterbox)."
 
 
 async def test_timeout_becomes_error_frame():
@@ -186,7 +196,7 @@ async def test_timeout_becomes_error_frame():
     audio, errors = await speak(handler, tts_timeout=0.2)
     assert not audio
     assert len(errors) == 1
-    assert "timed out after 0.2s" in errors[0].error
+    assert "did not answer in time" in errors[0].error
 
 
 async def test_bad_wav_becomes_error_frame():
@@ -196,4 +206,4 @@ async def test_bad_wav_becomes_error_frame():
     audio, errors = await speak(handler)
     assert not audio
     assert len(errors) == 1
-    assert "not a WAV" in errors[0].error
+    assert "could not be played" in errors[0].error

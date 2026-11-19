@@ -88,13 +88,39 @@ transport.input()
   shows them live. The page opens the data channel and sends RTVI `client-ready`.
 - **Warm-up:** when a call connects, start a background no-op request to Ollama (load
   the selected model) and a one-word synthesis to Chatterbox, so the first real turn
-  does not pay the cold-start cost. The UI shows "warming up" until both answer: the
-  server sends RTVI `server-message`s `{"type": "warmup", "state": "warming"}` and then
-  `{"type": "warmup", "state": "done", "ollama": bool, "chatterbox": bool}`.
-- **Metrics:** enable Pipecat metrics and log time-to-first-byte per service (STT, LLM,
-  TTS) for each turn, to find where latency goes. A small observer also logs, per turn,
-  when the transcript, first LLM token, first TTS audio and LLM end happen relative to
-  the end of the user's speech.
+  does not pay the cold-start cost. The UI shows "warming up" (with what is still
+  loading and for how long) until both answer: the server sends RTVI `server-message`s
+  `{"type": "warmup", "state": "warming", "pending": [...]}` as each one finishes and
+  then `{"type": "warmup", "state": "done", "ollama": bool, "chatterbox": bool,
+  "errors": {name: message}}`. The user can talk meanwhile; the first turn then waits
+  for the model inside Ollama. Changing the model mid-call warms the new model the same
+  way (with only `ollama` in the messages).
+- **Metrics:** enable Pipecat metrics. An observer logs one line per turn
+  (`Turn timing (session N): turn=… transcript=… turn_end=… first_text=… first_audio=…
+  llm_end=… ttfb_stt=… ttfb_llm=… ttfb_tts=… interrupted=yes|no`): seconds after the
+  end of the user's speech (as the VAD reports it) when the transcript arrived, the
+  turn ended, the LLM produced its first text, the bot's first audio started playing
+  (the headline number) and the LLM finished, plus Pipecat's time to first byte of each
+  service for that turn. For a model that reasons before answering, `first_text` is the
+  real wait; its LLM time to first byte only counts until the first (reasoning) chunk.
+  A turn's line is written when its reply has played, or when the user talks over it.
+- **Errors:** error frames that reach the pipeline worker become RTVI server messages
+  `{"type": "error", "service": "llm" | "tts" | "storage" | "other", "message": ...}`
+  in plain words (Ollama or Chatterbox unreachable, timed out, model or voice not
+  available, an HTTP error with the server's reason). The call goes on. Speech that
+  keeps failing (three sentences in a row, or Pipecat writing the TTS service off)
+  ends the call rather than leaving a silent bot. A server-side end of a call is
+  announced first: `{"type": "call-ended", "reason": ..., "message": ..., "retry":
+  bool}`; `retry` (on shutdown) asks the page to call again.
+- **Dropped calls:** the server ends a call whose client does not connect within 30 s
+  of the answer, or from which no audio arrives for 10 s (browsers send audio packets
+  even when muted; WebRTC itself takes about half a minute to notice a vanished peer).
+  The page treats a connection that fails, closes, or stays disconnected for 3 s, and
+  a data channel that closes without `call-ended`, as a drop: it reconnects onto the
+  same session after 1, 2, 4, 8 and 15 s, naming the dropped call in the offer
+  (`replaces`), which the server ends before answering. Hanging up never reconnects.
+  After a reconnect the page reloads the stored messages and starts a fresh live
+  transcript.
 
 ### Settings and mid-call changes
 
@@ -234,10 +260,20 @@ The budget and the summary prompt are config values, so they can be tuned per mo
 | `POST` | `/api/offer` | WebRTC offer/answer for a call on a session (`session_id` in the body) |
 | `GET` | `/api/health` | Liveness, plus reachability of Ollama and Chatterbox |
 
-Only one call runs at a time. A second offer while a call is active gets HTTP 409.
-Sessions carry `in_call` while a call runs on them. `PATCH` validates its fields (422 for
-unknown fields, nulls, an empty model or voice); a PATCH to the session in a call also
-queues update-settings frames into that call's pipeline.
+Only one call runs at a time. A second offer while a call is active gets HTTP 409 with
+`{"detail": {"message": ..., "session_id": ...}}`; the slot is claimed atomically and
+released however the call ends (including setup failures and offers that fail). An
+offer may name the call it `replaces` (the page's own dropped call), which is ended
+first. Sessions carry `in_call` while a call runs on them, and `/api/health` reports
+`call` (`{"session_id": ...}` or null). `PATCH` validates its fields (422 for unknown
+fields, nulls, an empty model or voice, and a model or voice that Ollama or Chatterbox
+does not list; a service that cannot be asked right now does not block the change); a
+PATCH to the session in a call also queues update-settings frames into that call's
+pipeline. Upstream failures in `/api/models`, `/api/voices` (502) and the first
+`POST /api/sessions` (503) carry a plain-words `detail`.
+
+On SIGTERM the server ends a running call (telling the page to call again), waits at
+most a few seconds for it, and exits.
 
 ## Web UI
 
@@ -257,6 +293,11 @@ can switch to Pipecat's JS client SDK vendored as ES modules.
   stop between sentences whenever synthesis is slower than playback.
 - Mute toggle.
 - Works on a phone-width screen.
+- Notices above the call controls for upstream problems and call errors: the page
+  checks `/api/health` on load, every 30 s (10 s while Ollama is down) and when it
+  regains focus, and disables Call while Ollama is unreachable; it warns when Chatterbox
+  is not answering, when the session's model or voice is not installed, when a call
+  runs elsewhere (another tab or device), and explains a missing or denied microphone.
 
 The browser's echo cancellation and noise suppression are requested on the mic track,
 which is what makes barge-in work on a phone speaker.
@@ -294,6 +335,7 @@ Environment variables, set by the NixOS module:
 | `VOICEDM_MEMORY_BUDGET` | `6000` | Characters of recent messages before the older half is folded into the summary |
 | `VOICEDM_SUMMARY_PROMPT` | built in | Instructions for writing the summary |
 | `VOICEDM_SUMMARY_TIMEOUT` | `300` | Seconds for one summarisation request |
+| `VOICEDM_LOG_LEVEL` | `INFO` | Log level; `DEBUG` adds Pipecat's per-frame detail, including conversation text |
 
 The memory settings have no dedicated NixOS module options; set them through the
 module's `environment` option.

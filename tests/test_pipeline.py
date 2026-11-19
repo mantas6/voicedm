@@ -36,7 +36,7 @@ from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
 
-from voicedm.bot import TurnRecorder, settings_frames
+from voicedm.bot import ErrorReporter, TurnRecorder, TurnTimingObserver, settings_frames
 from voicedm.memory import SUMMARY_HEADER, CallMemory, MemoryLLMService, build_context
 from voicedm.storage import Storage
 from voicedm.tts_chatterbox import ChatterboxTTSService
@@ -122,7 +122,9 @@ class Call:
         *,
         summarise=None,
         budget: int = 6000,
+        tts_status: int = 200,
     ) -> None:
+        self.tts_status = tts_status
         self.store = store
         self.session_id = session["id"]
         self.tts_requests: list[dict] = []
@@ -155,15 +157,28 @@ class Call:
             lambda: self.llm.settings.model,
             after_reply=self.memory.request_fold,
         ).attach(aggregators)
+        output = PlaybackOutput()
         pipeline = Pipeline(
-            [aggregators.user(), self.llm, self.tts, PlaybackOutput(), aggregators.assistant()]
+            [aggregators.user(), self.llm, self.tts, output, aggregators.assistant()]
         )
+        self.timing = TurnTimingObserver({"llm": self.llm, "tts": self.tts}, output)
         self.worker = PipelineWorker(
             pipeline,
-            params=PipelineParams(audio_out_sample_rate=24000),
+            params=PipelineParams(audio_out_sample_rate=24000, enable_metrics=True),
             enable_rtvi=False,
             idle_timeout_secs=None,
+            observers=[self.timing],
         )
+        self.reports: list[tuple[str, str]] = []
+        self.gave_up: list[str] = []
+        errors = ErrorReporter(
+            self.llm, self.tts, lambda s, m: self.reports.append((s, m)), self.gave_up.append
+        )
+
+        @self.worker.event_handler("on_pipeline_error")
+        async def on_error(worker, frame) -> None:
+            errors.handle(frame)
+
         self.runner = WorkerRunner(handle_sigint=False)
         self._run: asyncio.Task | None = None
 
@@ -173,6 +188,8 @@ class Call:
 
     def _tts(self, request: httpx.Request) -> httpx.Response:
         self.tts_requests.append(json.loads(request.content))
+        if self.tts_status != 200:
+            return httpx.Response(self.tts_status, json={"detail": "the voice server broke"})
         return httpx.Response(200, content=wav_bytes())
 
     async def __aenter__(self) -> "Call":
@@ -546,3 +563,46 @@ async def test_settings_change_keeps_the_summary(store):
         f"Old prompt.\n\n{SUMMARY_HEADER}\nEarlier things.",
         f"New prompt.\n\n{SUMMARY_HEADER}\nEarlier things.",
     ]
+
+
+# -- latency logging and errors in a running call --
+
+
+async def test_turn_timing_in_a_call_with_an_interruption(store):
+    session = await store.create_session("model-a", "Alpha.wav", "")
+    hold = asyncio.Event()
+    replies = [[hold if c == "hold" else c for c in STALLING_REPLY], ["Sure."]]
+    async with Call(store, session, [], replies) as call:
+        await call.say("Tell me a story")
+        await into_second_sentence(call)
+        await call.say("Stop, something else")
+        await call.wait_for_messages(4)
+
+        async def logged() -> bool:
+            return len(call.timing.turns) == 2
+
+        await eventually(logged)
+    first, second = call.timing.turns
+    assert (first["interrupted"], second["interrupted"]) == (True, False)
+    for turn in (first, second):
+        assert 0 < turn["turn_end"] <= turn["first_text"] <= turn["first_audio"]
+        assert turn["ttfb_tts"] is not None
+    assert second["llm_end"] is not None
+    # The second turn's times are its own, not the interrupted reply's.
+    assert second["first_audio"] < 2.0
+
+
+async def test_speech_that_keeps_failing_ends_the_call(store):
+    session = await store.create_session("model-a", "Alpha.wav", "")
+    replies = [["One. Two. Three. Four."]]
+    async with Call(store, session, [], replies, tts_status=500) as call:
+        await call.say("Count to four")
+
+        async def gave_up() -> bool:
+            return bool(call.gave_up)
+
+        await eventually(gave_up)
+    assert len(call.tts_requests) >= 3
+    service, message = call.reports[0]
+    assert service == "tts"
+    assert "HTTP 500" in message and "the voice server broke" in message

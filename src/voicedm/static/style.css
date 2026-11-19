@@ -323,6 +323,11 @@ textarea {
   color: var(--muted);
 }
 
+/* A reply that has no text yet (the model is still thinking). */
+.message .body:empty + .pending:empty::before {
+  content: "…";
+}
+
 .message .meta {
   display: block;
   margin-top: 0.25rem;
@@ -385,6 +390,65 @@ textarea {
 
 .dot[data-state="error"] {
   background: var(--danger);
+}
+
+.dot[data-state="reconnecting"] {
+  background: var(--danger);
+  animation: pulse 0.9s ease-in-out infinite;
+}
+
+/* -- notices: upstream problems, call errors -- */
+
+.notices {
+  list-style: none;
+  margin: 0;
+  padding: 0 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.notices:not(:empty) {
+  padding-bottom: 0.5rem;
+}
+
+.notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  padding: 0.5rem 0.5rem 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--warn);
+  border-radius: 8px;
+  background: var(--panel);
+  font-size: 0.875rem;
+  line-height: 1.4;
+}
+
+.notice.error {
+  border-left-color: var(--danger);
+}
+
+.notice.info {
+  border-left-color: var(--muted);
+}
+
+.notice p {
+  flex: 1;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.notice button {
+  flex: none;
+  padding: 0 0.3rem;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 1.1rem;
+  line-height: 1.2;
+  cursor: pointer;
 }
 
 @keyframes pulse {

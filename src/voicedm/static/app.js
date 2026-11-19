@@ -24,6 +24,7 @@ const els = {
   mute: $("mute"),
   call: $("call"),
   remote: $("remote"),
+  notices: $("notices"),
 };
 
 // Pause after "bot stopped speaking" before showing "Listening": the server reports
@@ -31,6 +32,15 @@ const els = {
 const LISTEN_DELAY_MS = 700;
 // Time for the server to save the last turn after a hang-up before reloading.
 const RELOAD_DELAY_MS = 1200;
+// After the connection reports "disconnected", how long to wait for it to recover
+// on its own before treating the call as dropped.
+const DISCONNECT_GRACE_MS = 3000;
+// Pauses before each reconnect attempt after a dropped call.
+const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 15000];
+// How often to check the upstreams while not in a call (and when the page regains
+// focus); more often while the language model server is down.
+const HEALTH_POLL_MS = 30000;
+const HEALTH_POLL_DOWN_MS = 10000;
 
 const state = {
   session: null, // current session, with messages
@@ -43,6 +53,15 @@ const state = {
   callState: "idle",
   listenTimer: null,
   live: null, // the live transcript of the current call
+  // The current call: { pc, channel, pcId, sessionId, ended }. `pc` is also kept in
+  // state.pc; while reconnecting after a drop, state.pc is null and state.call stays.
+  call: null,
+  reconnect: null, // { attempt, timer } while reconnecting after a dropped call
+  warming: null, // { since, pending: [...] } while upstreams warm up
+  warmTimer: null,
+  health: null, // last /api/health answer
+  healthTimer: null,
+  notices: new Map(), // key -> { kind, text }
 };
 
 // -- helpers --
@@ -56,8 +75,12 @@ async function api(method, path, body) {
   const response = await fetch(path, options);
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    const detail = Array.isArray(data.detail) ? data.detail[0]?.msg : data.detail;
-    throw new Error(detail ?? `HTTP ${response.status}`);
+    const detail = data.detail;
+    const message = Array.isArray(detail) ? detail[0]?.msg : (detail?.message ?? detail);
+    const err = new Error(message ?? `HTTP ${response.status}`);
+    err.status = response.status;
+    err.detail = detail;
+    throw err;
   }
   return data;
 }
@@ -86,8 +109,9 @@ function relativeTime(iso) {
   return new Date(iso).toLocaleDateString();
 }
 
+// In a call: connected, connecting, or reconnecting after a drop.
 function inCall() {
-  return state.pc !== null;
+  return state.call !== null;
 }
 
 // -- status --
@@ -99,14 +123,78 @@ const STATUS_TEXT = {
   listening: "Listening",
   thinking: "Thinking…",
   speaking: "Speaking",
+  reconnecting: "Reconnecting…",
 };
+
+const UPSTREAM_NAMES = { ollama: "the language model", chatterbox: "the voice" };
 
 function setCallState(name, text) {
   clearTimeout(state.listenTimer);
   state.listenTimer = null;
   state.callState = name;
+  state.statusText = text ?? null;
   els.dot.dataset.state = name;
-  els.status.textContent = text ?? STATUS_TEXT[name] ?? name;
+  renderStatus();
+}
+
+// The status line; while upstreams warm up (which can take tens of seconds on a cold
+// start), it says what is still loading and for how long.
+function renderStatus() {
+  const name = state.callState;
+  let text = state.statusText ?? STATUS_TEXT[name] ?? name;
+  const warming = state.warming;
+  if (warming && ["warming", "listening", "thinking"].includes(name)) {
+    const seconds = Math.round((Date.now() - warming.since) / 1000);
+    const what = warming.pending.map((p) => UPSTREAM_NAMES[p] ?? p).join(" and ");
+    if (name === "warming") text = `Warming up ${what}… ${seconds}s`;
+    else text += ` · warming up ${what} (${seconds}s)`;
+  }
+  els.status.textContent = text;
+}
+
+function setWarming(pending) {
+  if (pending.length) {
+    state.warming = { since: state.warming?.since ?? Date.now(), pending };
+    state.warmTimer ??= setInterval(renderStatus, 1000);
+  } else {
+    state.warming = null;
+    clearInterval(state.warmTimer);
+    state.warmTimer = null;
+  }
+  renderStatus();
+}
+
+// -- notices: upstream problems and call errors, shown above the call controls --
+
+function setNotice(key, kind, text) {
+  if (text) state.notices.set(key, { kind, text });
+  else state.notices.delete(key);
+  renderNotices();
+}
+
+// Notices that say less than another one shown at the same time.
+const COVERED_BY = {
+  models: ["ollama"],
+  voices: ["chatterbox"],
+  busy: ["call"],
+  chatterbox: ["call-tts", "warmup", "call"],
+};
+
+function renderNotices() {
+  els.notices.replaceChildren();
+  const shown = new Set();
+  for (const [key, { kind, text }] of state.notices) {
+    const covered = (COVERED_BY[key] ?? []).some((other) => state.notices.has(other));
+    if (covered || shown.has(text)) continue;
+    shown.add(text);
+    const item = el("li", `notice ${kind}`);
+    const close = el("button", null, "×");
+    close.type = "button";
+    close.setAttribute("aria-label", "Dismiss");
+    close.addEventListener("click", () => setNotice(key));
+    item.append(el("p", null, text), close);
+    els.notices.append(item);
+  }
 }
 
 // -- sessions --
@@ -116,13 +204,10 @@ function renderSessions() {
   for (const session of state.sessions) {
     const button = el("button");
     button.type = "button";
+    const meta = `${session.message_count} messages · ${relativeTime(session.updated_at)}`;
     button.append(
       el("span", "session-title", session.title || "Untitled session"),
-      el(
-        "span",
-        "session-meta",
-        `${session.message_count} messages · ${relativeTime(session.updated_at)}`,
-      ),
+      el("span", "session-meta", session.in_call ? `${meta} · in a call` : meta),
     );
     const current = state.session?.id === session.id;
     button.setAttribute("aria-current", String(current));
@@ -136,6 +221,11 @@ function renderSessions() {
     els.sessions.append(item);
   }
   els.newSession.disabled = inCall();
+}
+
+function sessionTitle(id) {
+  const session = state.sessions.find((s) => s.id === id);
+  return session?.title || "an untitled session";
 }
 
 async function loadSessions() {
@@ -185,6 +275,23 @@ function renderSettings() {
   els.savePrompt.disabled = els.prompt.value === s.system_prompt;
   els.settingsSummary.textContent = `${shortModel(s.model)} · ${shortVoice(s.voice)}`;
   els.settingsNote.textContent = inCall() ? "Changes apply from the next turn." : "";
+  renderSettingsNotice();
+}
+
+// The session's model or voice is no longer offered (only known while the lists load).
+function renderSettingsNotice() {
+  const s = state.session;
+  const missing = [];
+  if (state.models.length && !state.models.includes(s.model)) {
+    missing.push(`model “${shortModel(s.model)}” is not installed in Ollama`);
+  }
+  if (state.voices.length && !state.voices.includes(s.voice)) {
+    missing.push(`voice “${shortVoice(s.voice)}” is not offered by Chatterbox`);
+  }
+  const text = missing.length
+    ? `This session's ${missing.join(" and its ")}. Pick another in Settings.`
+    : null;
+  setNotice("settings", "warn", text);
 }
 
 function renderSession() {
@@ -364,26 +471,20 @@ function scheduleListening() {
   }, LISTEN_DELAY_MS);
 }
 
-function onServerMessage(event) {
+function onServerMessage(call, event) {
+  // Messages of a call that has been replaced or ended are stale.
+  if (state.call !== call || !state.live) return;
   let msg;
   try {
     msg = JSON.parse(event.data);
   } catch {
     return;
   }
-  if (msg.label !== "rtvi-ai" || !state.live) return;
+  if (msg.label !== "rtvi-ai") return;
   const data = msg.data ?? {};
   switch (msg.type) {
     case "server-message":
-      if (data.type === "warmup") {
-        if (data.state === "warming") {
-          setCallState("warming");
-        } else {
-          const down = ["ollama", "chatterbox"].filter((name) => !data[name]);
-          if (down.length) setCallState("error", `Warm-up failed: ${down.join(", ")}`);
-          else if (state.callState === "warming") setCallState("listening");
-        }
-      }
+      onAppMessage(call, data);
       break;
     case "user-started-speaking":
       if (replyInProgress()) finishBotReply(true);
@@ -424,70 +525,283 @@ function onServerMessage(event) {
       scheduleListening();
       break;
     case "error":
-      setCallState("error", `Error: ${data.error ?? "unknown"}`);
+      // Pipecat's raw error; the server follows it with an "error" server message
+      // that says what went wrong in plain words.
+      console.warn("voicedm: pipeline error", data.error);
       break;
   }
 }
 
+// The server's own messages: warm-up progress, errors, and why it ended a call.
+function onAppMessage(call, data) {
+  switch (data.type) {
+    case "warmup":
+      if (data.state === "warming") {
+        setWarming(data.pending ?? ["ollama", "chatterbox"]);
+        if (state.callState === "connecting") setCallState("warming");
+      } else {
+        setWarming([]);
+        const failed = Object.entries(data.errors ?? {});
+        const down = ["ollama", "chatterbox"].filter((name) => data[name] === false);
+        const text = failed.length
+          ? failed.map(([, message]) => message).join(" ")
+          : down.length
+            ? `Could not warm up ${down.map((d) => UPSTREAM_NAMES[d]).join(" and ")}.`
+            : null;
+        setNotice("warmup", "error", text);
+        if (["warming", "connecting"].includes(state.callState)) setCallState("listening");
+      }
+      break;
+    case "error":
+      setNotice(`call-${data.service}`, "error", data.message);
+      // A reply that failed leaves nothing to wait for.
+      if (data.service === "llm" && state.callState === "thinking") setCallState("listening");
+      break;
+    case "call-ended":
+      call.ended = true;
+      if (data.retry) {
+        dropped(call, data.message ?? "The server ended the call");
+      } else {
+        endCall("Call ended", "error");
+        // The reason replaces what the call reported on its way there.
+        for (const key of state.notices.keys()) {
+          if (key.startsWith("call-") || key === "warmup") state.notices.delete(key);
+        }
+        setNotice("call", "error", data.message ?? "The server ended the call.");
+      }
+      break;
+  }
+}
+
+function micError(err) {
+  switch (err.name) {
+    case "NotAllowedError":
+    case "SecurityError":
+      return "Microphone access was denied. Allow it for this site in the browser's settings, then press Call again.";
+    case "NotFoundError":
+    case "OverconstrainedError":
+      return "No microphone was found.";
+    case "NotReadableError":
+      return "The microphone could not be opened; another app may be using it.";
+    default:
+      return `The microphone could not be opened: ${err.message}`;
+  }
+}
+
+// Browsers only give pages on a secure origin (HTTPS or localhost) the microphone.
+function micUnavailable() {
+  if (window.isSecureContext && navigator.mediaDevices?.getUserMedia) return null;
+  return (
+    "The microphone is only available on a secure page. Open voicedm over HTTPS " +
+    "(for example through a reverse proxy) or on localhost."
+  );
+}
+
+// Pressing Call: the microphone, then a connection.
 async function call() {
-  if (!state.session) return;
+  if (!state.session || inCall()) return;
+  const blocked = micUnavailable();
+  if (blocked) {
+    setNotice("mic", "error", blocked);
+    return;
+  }
+  setNotice("mic");
+  for (const key of state.notices.keys()) {
+    if (key.startsWith("call") || key === "warmup") setNotice(key);
+  }
   els.call.disabled = true;
   setCallState("connecting");
   state.live = newLive();
+  state.call = { sessionId: state.session.id, pcId: null };
+  renderCallControls();
+  const call = state.call;
+  let mic;
   try {
-    state.mic = await navigator.mediaDevices.getUserMedia({
+    mic = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
-    applyMute();
-    const pc = new RTCPeerConnection();
-    state.pc = pc;
-    pc.addTransceiver(state.mic.getAudioTracks()[0], { direction: "sendrecv" });
-    pc.addEventListener("track", (event) => {
-      els.remote.srcObject = event.streams[0] ?? new MediaStream([event.track]);
-      els.remote.play().catch(() => {});
-    });
-    pc.addEventListener("connectionstatechange", () => {
-      if (state.pc === pc && ["failed", "closed"].includes(pc.connectionState)) {
-        hangUp(`Call ${pc.connectionState}`);
-      }
-    });
+  } catch (err) {
+    if (state.call === call) endCall("Call failed", "error");
+    setNotice("mic", "error", micError(err));
+    return;
+  } finally {
+    els.call.disabled = false;
+  }
+  if (state.call !== call) {
+    // Hung up while the browser was asking for the microphone.
+    for (const track of mic.getTracks()) track.stop();
+    return;
+  }
+  state.mic = mic;
+  applyMute();
+  try {
+    await connect(call);
+  } catch (err) {
+    if (state.call !== call) return;
+    if (err.status === 409) {
+      endCall("Busy", "error");
+      setNotice("call", "error", err.message);
+      refreshHealth();
+    } else {
+      endCall("Call failed", "error");
+      setNotice("call", "error", `The call could not be started: ${err.message}`);
+    }
+  }
+}
 
-    const channel = pc.createDataChannel("messages", { ordered: true });
-    channel.addEventListener("open", () => {
-      channel.send(
-        JSON.stringify({
-          label: "rtvi-ai",
-          type: "client-ready",
-          id: crypto.randomUUID(),
-          data: { version: "2.3.0", about: { library: "voicedm-page" } },
-        }),
-      );
-    });
-    channel.addEventListener("message", onServerMessage);
+// Open a peer connection for `call` and exchange the offer; on a reconnect the
+// server ends the dropped call (`replaces`) before answering.
+async function connect(call, replaces = null) {
+  const pc = new RTCPeerConnection();
+  call.pc = pc;
+  call.ended = false;
+  state.pc = pc;
+  pc.addTransceiver(state.mic.getAudioTracks()[0], { direction: "sendrecv" });
+  pc.addEventListener("track", (event) => {
+    els.remote.srcObject = event.streams[0] ?? new MediaStream([event.track]);
+    els.remote.play().catch(() => {});
+  });
+  let graceTimer = null;
+  pc.addEventListener("connectionstatechange", () => {
+    if (state.pc !== pc) return;
+    clearTimeout(graceTimer);
+    if (pc.connectionState === "disconnected") {
+      // Often recovers by itself; give it a moment.
+      graceTimer = setTimeout(() => {
+        if (state.pc === pc && pc.connectionState !== "connected") dropped(call);
+      }, DISCONNECT_GRACE_MS);
+    } else if (["failed", "closed"].includes(pc.connectionState)) {
+      dropped(call);
+    }
+  });
 
+  const channel = pc.createDataChannel("messages", { ordered: true });
+  channel.addEventListener("open", () => {
+    channel.send(
+      JSON.stringify({
+        label: "rtvi-ai",
+        type: "client-ready",
+        id: crypto.randomUUID(),
+        data: { version: "2.3.0", about: { library: "voicedm-page" } },
+      }),
+    );
+  });
+  channel.addEventListener("message", (event) => onServerMessage(call, event));
+  // The server closes the channel when it ends the call; unless it said why
+  // (call-ended, handled first: the channel is ordered), the call dropped.
+  channel.addEventListener("close", () => {
+    if (state.pc === pc && !call.ended) dropped(call);
+  });
+
+  try {
     await pc.setLocalDescription(await pc.createOffer());
     await waitForIceGathering(pc);
     const answer = await api("POST", "/api/offer", {
       sdp: pc.localDescription.sdp,
       type: pc.localDescription.type,
-      session_id: state.session.id,
+      session_id: call.sessionId,
+      replaces,
     });
+    if (state.pc !== pc) return; // hung up meanwhile
+    call.pcId = answer.pc_id;
     await pc.setRemoteDescription({ sdp: answer.sdp, type: answer.type });
-
-    els.call.textContent = "Hang up";
-    els.call.classList.add("active");
-    els.mute.disabled = false;
-    renderSessions();
-    renderSettings();
   } catch (err) {
-    hangUp(`Call failed: ${err.message}`, "error");
-  } finally {
-    els.call.disabled = false;
+    if (state.pc === pc) state.pc = null;
+    pc.close();
+    throw err;
   }
 }
 
-function hangUp(message = "Call ended", stateName = "idle") {
-  const wasInCall = state.pc !== null;
+// The connection of `call` is gone without a hang-up: tell the user and reconnect
+// onto the same session, with a growing pause between attempts.
+function dropped(call, why = "Connection lost") {
+  if (state.call !== call || state.reconnect) return;
+  const peer = call.pc;
+  if (state.pc === peer) state.pc = null;
+  peer?.close();
+  finishBotReply(true);
+  setWarming([]);
+  els.remote.srcObject = null;
+  why = why.replace(/[.\s]+$/, "");
+  state.reconnect = { attempt: 0, timer: null, why, replaces: call.pcId };
+  scheduleReconnect(call);
+}
+
+function scheduleReconnect(call) {
+  const r = state.reconnect;
+  if (r.attempt >= RECONNECT_DELAYS_MS.length) {
+    endCall("Call dropped", "error");
+    setNotice("call", "error", `${r.why}, and reconnecting failed. Press Call to try again.`);
+    return;
+  }
+  const delay = RECONNECT_DELAYS_MS[r.attempt];
+  r.attempt += 1;
+  setCallState("reconnecting", `Reconnecting (${r.attempt}/${RECONNECT_DELAYS_MS.length})…`);
+  setNotice("call", "warn", `${r.why}. Reconnecting to this session…`);
+  r.timer = setTimeout(() => reconnect(call), delay);
+}
+
+async function reconnect(call) {
+  const r = state.reconnect;
+  if (state.call !== call || !r) return;
+  try {
+    await connect(call, r.replaces);
+  } catch (err) {
+    if (state.call !== call || state.reconnect !== r) return; // hung up meanwhile
+    // Another call took over (409), or the session is gone: stop trying.
+    if (err.status && err.status < 500 && err.status !== 408) {
+      endCall("Call dropped", "error");
+      setNotice("call", "error", `Could not reconnect: ${err.message}`);
+      if (err.status === 409) refreshHealth();
+      return;
+    }
+    scheduleReconnect(call);
+    return;
+  }
+  if (state.call !== call) return;
+  state.reconnect = null;
+  setNotice("call");
+  setCallState("connecting");
+  // The dropped call's turns are stored by now; show them from the server and
+  // start a fresh live transcript, so nothing is listed twice.
+  try {
+    const session = await api("GET", `/api/sessions/${call.sessionId}`);
+    if (state.call === call && state.session?.id === call.sessionId) {
+      state.session = session;
+      finishBotReply(true);
+      state.live = newLive();
+      renderTranscript();
+    }
+  } catch {
+    state.live = newLive();
+  }
+}
+
+function renderCallControls() {
+  els.call.textContent = inCall() ? "Hang up" : "Call";
+  els.call.classList.toggle("active", inCall());
+  els.mute.disabled = !inCall();
+  renderAvailability();
+  renderSessions();
+  if (state.session) renderSettings();
+}
+
+// Pressing Hang up: never followed by a reconnect.
+function hangUp() {
+  endCall("Call ended");
+}
+
+function endCall(message = "Call ended", stateName = "idle") {
+  const call = state.call;
+  state.call = null;
+  if (state.reconnect) {
+    clearTimeout(state.reconnect.timer);
+    state.reconnect = null;
+    setNotice("call");
+  }
+  // The server lets go of the call in a moment; until the next check, the last one
+  // would still show it as running elsewhere.
+  if (call && state.health?.call) state.health = { ...state.health, call: null };
   if (state.pc) {
     const peer = state.pc;
     state.pc = null;
@@ -499,14 +813,11 @@ function hangUp(message = "Call ended", stateName = "idle") {
   }
   finishBotReply(true);
   state.live = null;
+  setWarming([]);
   els.remote.srcObject = null;
-  els.call.textContent = "Call";
-  els.call.classList.remove("active");
-  els.mute.disabled = true;
   setCallState(stateName, message);
-  renderSessions();
-  if (state.session) renderSettings();
-  if (wasInCall && state.session) {
+  renderCallControls();
+  if (call && state.session) {
     // Replace the live transcript with what the server stored.
     const id = state.session.id;
     setTimeout(async () => {
@@ -515,12 +826,97 @@ function hangUp(message = "Call ended", stateName = "idle") {
       await loadSessions().catch(() => {});
     }, RELOAD_DELAY_MS);
   }
+  // Once the server has let go of the call.
+  setTimeout(refreshHealth, RELOAD_DELAY_MS);
 }
 
 function applyMute() {
   for (const track of state.mic?.getAudioTracks() ?? []) track.enabled = !state.muted;
   els.mute.setAttribute("aria-pressed", String(state.muted));
   els.mute.textContent = state.muted ? "Unmute" : "Mute";
+}
+
+// -- upstream health --
+
+// Check the upstreams and the server's call; reschedules itself while idle.
+async function refreshHealth() {
+  clearTimeout(state.healthTimer);
+  const before = state.health;
+  try {
+    state.health = await api("GET", "/api/health");
+  } catch {
+    state.health = { status: "down" };
+  }
+  const h = state.health;
+  // An upstream that came back: reload what it lists.
+  if (before && h.upstreams) {
+    if (h.upstreams.ollama && !before.upstreams?.ollama) loadModels();
+    if (h.upstreams.chatterbox && !before.upstreams?.chatterbox) loadVoices();
+  }
+  renderAvailability();
+  if (h.call && !inCall()) loadSessions().catch(() => {});
+  const down = h.status !== "ok" || !h.upstreams?.ollama;
+  state.healthTimer = setTimeout(refreshHealth, down ? HEALTH_POLL_DOWN_MS : HEALTH_POLL_MS);
+}
+
+function renderAvailability() {
+  const h = state.health;
+  const mic = micUnavailable();
+  let reason = null;
+  if (!h) {
+    reason = null;
+  } else if (h.status !== "ok") {
+    reason = "The voicedm server is not reachable.";
+  } else if (!h.upstreams.ollama) {
+    reason = "The language model server (Ollama) is not reachable, so a call cannot start. Checking again every few seconds.";
+  }
+  if (!inCall()) {
+    els.call.disabled = Boolean(reason || mic);
+    els.call.title = reason ?? mic ?? "";
+  }
+  setNotice("ollama", "error", inCall() ? null : reason);
+  setNotice(
+    "chatterbox",
+    "warn",
+    h?.status === "ok" && !h.upstreams.chatterbox
+      ? "The voice server (Chatterbox) is not answering. It may still be starting; calls can fail until it does."
+      : null,
+  );
+  const elsewhere = h?.call && !inCall() ? h.call.session_id : null;
+  setNotice(
+    "busy",
+    "info",
+    elsewhere !== null
+      ? `A call is running on “${sessionTitle(elsewhere)}” in another tab or on another device.`
+      : null,
+  );
+  if (mic) setNotice("mic", "error", mic);
+}
+
+async function loadModels() {
+  try {
+    state.models = await api("GET", "/api/models");
+    setNotice(
+      "models",
+      "error",
+      state.models.length ? null : "Ollama has no models installed. Pull one with “ollama pull”.",
+    );
+  } catch (err) {
+    state.models = [];
+    setNotice("models", "warn", `Cannot list the models: ${err.message}`);
+  }
+  if (state.session) renderSettings();
+}
+
+async function loadVoices() {
+  try {
+    state.voices = await api("GET", "/api/voices");
+    setNotice("voices", "error", state.voices.length ? null : "Chatterbox lists no voices.");
+  } catch (err) {
+    state.voices = [];
+    setNotice("voices", "warn", `Cannot list the voices: ${err.message}`);
+  }
+  if (state.session) renderSettings();
 }
 
 // -- drawer (phone width) --
@@ -581,16 +977,8 @@ window.addEventListener("hashchange", () => {
 });
 
 async function init() {
-  const [models, voices] = await Promise.allSettled([
-    api("GET", "/api/models"),
-    api("GET", "/api/voices"),
-  ]);
-  state.models = models.status === "fulfilled" ? models.value : [];
-  state.voices = voices.status === "fulfilled" ? voices.value : [];
-  const down = [];
-  if (models.status === "rejected") down.push("Ollama");
-  if (voices.status === "rejected") down.push("Chatterbox");
-
+  renderAvailability();
+  await Promise.all([loadModels(), loadVoices(), refreshHealth()]);
   try {
     await loadSessions();
     if (!state.sessions.length) {
@@ -600,10 +988,19 @@ async function init() {
     const wanted = Number(location.hash.slice(1));
     const id = state.sessions.some((s) => s.id === wanted) ? wanted : state.sessions[0].id;
     await selectSession(id);
-    if (down.length) setCallState("error", `Cannot reach ${down.join(" and ")}`);
+    renderAvailability();
   } catch (err) {
-    setCallState("error", `Cannot load sessions: ${err.message}`);
+    setCallState("error", "Cannot load sessions");
+    setNotice("sessions", "error", `Cannot load sessions: ${err.message}`);
   }
 }
+
+// Check the upstreams again when the page comes back into view.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && !inCall()) refreshHealth();
+});
+window.addEventListener("focus", () => {
+  if (!inCall()) refreshHealth();
+});
 
 init();
