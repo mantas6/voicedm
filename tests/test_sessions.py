@@ -36,15 +36,22 @@ def test_new_session_copies_the_latest_session_settings():
         first = client.post("/api/sessions").json()
         client.patch(
             f"/api/sessions/{first['id']}",
-            json={"model": "second-model:7b", "voice": "Beta.wav", "system_prompt": "Be terse."},
+            json={
+                "model": "second-model:7b",
+                "voice": "Beta.wav",
+                "system_prompt": "Be terse.",
+                "expressions": True,
+            },
         )
         second = client.post("/api/sessions").json()
+    assert first["expressions"] is False  # off until switched on
     assert second["id"] != first["id"]
     assert (second["model"], second["voice"], second["system_prompt"]) == (
         "second-model:7b",
         "Beta.wav",
         "Be terse.",
     )
+    assert second["expressions"] is True
 
 
 def test_new_session_copies_a_named_session():
@@ -114,6 +121,18 @@ def test_patch_changes_fields_and_keeps_others():
         assert client.get(f"/api/sessions/{session['id']}").json()["system_prompt"] == ""
 
 
+def test_patch_switches_expressions():
+    with client_for() as client:
+        sid = client.post("/api/sessions").json()["id"]
+        on = client.patch(f"/api/sessions/{sid}", json={"expressions": True})
+        assert on.status_code == 200
+        assert on.json()["expressions"] is True
+        assert client.get(f"/api/sessions/{sid}").json()["expressions"] is True
+        assert [s["expressions"] for s in client.get("/api/sessions").json()] == [True]
+        off = client.patch(f"/api/sessions/{sid}", json={"expressions": False})
+        assert off.json()["expressions"] is False
+
+
 def test_patch_rejects_bad_fields():
     with client_for() as client:
         sid = client.post("/api/sessions").json()["id"]
@@ -126,6 +145,9 @@ def test_patch_rejects_bad_fields():
             {"summary": "x"},
             {"model": 3},
             {"title": "x" * 201},
+            {"expressions": None},
+            {"expressions": "yes"},
+            {"expressions": 1},
         ):
             assert client.patch(f"/api/sessions/{sid}", json=body).status_code == 422, body
 

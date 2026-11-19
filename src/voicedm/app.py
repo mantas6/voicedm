@@ -19,7 +19,7 @@ from pipecat.transports.smallwebrtc.request_handler import (
     SmallWebRTCRequest,
     SmallWebRTCRequestHandler,
 )
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 from starlette.datastructures import Headers
 from starlette.responses import FileResponse, Response
 from starlette.staticfiles import NotModifiedResponse
@@ -60,7 +60,7 @@ class PageFiles(StaticFiles):
         return response
 
 
-SettingsHandler = Callable[[dict[str, str]], Awaitable[None]]
+SettingsHandler = Callable[[dict[str, Any]], Awaitable[None]]
 # (reason, message for the page, whether the page should call again)
 EndHandler = Callable[[str, str | None, bool], Awaitable[None]]
 
@@ -82,9 +82,9 @@ class ActiveCall:
         self.task: asyncio.Task | None = None
         self._handler: SettingsHandler | None = None
         self._end: EndHandler | None = None
-        self._pending: dict[str, str] = {}
+        self._pending: dict[str, Any] = {}
 
-    async def update_settings(self, changes: dict[str, str]) -> None:
+    async def update_settings(self, changes: dict[str, Any]) -> None:
         if self._handler is None:
             self._pending.update(changes)
         else:
@@ -186,6 +186,8 @@ class SessionPatch(BaseModel):
     model: str = Field(default=None, min_length=1, max_length=200)
     voice: str = Field(default=None, min_length=1, max_length=200)
     system_prompt: str = Field(default=None, max_length=20000)
+    # Voice actions such as *laughs* as sounds instead of reading them out.
+    expressions: StrictBool = Field(default=None)
 
 
 def create_app(
@@ -284,8 +286,10 @@ def create_app(
             source = await existing_session(request, body.copy_from)
         else:
             source = await store.latest_session()
+        expressions = False
         if source:
             model, voice, prompt = source["model"], source["voice"], source["system_prompt"]
+            expressions = source["expressions"]
         else:
             upstreams = upstreams_of(request)
             try:
@@ -297,7 +301,7 @@ def create_app(
             except UpstreamError as e:
                 raise HTTPException(status_code=503, detail=explain(e, CHATTERBOX)) from e
             prompt = DEFAULT_SYSTEM_PROMPT
-        session = await store.create_session(model, voice, prompt)
+        session = await store.create_session(model, voice, prompt, expressions=expressions)
         return {**with_call_state(session), "messages": []}
 
     @app.get("/api/sessions/{session_id}")

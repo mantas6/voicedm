@@ -137,7 +137,11 @@ class Call:
             ),
         )
         self.tts = ChatterboxTTSService(
-            base_url="http://tts.test", voice=session["voice"], client=self.http, timeout=2
+            base_url="http://tts.test",
+            voice=session["voice"],
+            client=self.http,
+            timeout=2,
+            expressions=session["expressions"],
         )
         self.context = LLMContext(messages=build_context(session, history))
         self.memory = CallMemory(
@@ -352,6 +356,41 @@ async def test_settings_changes_apply_from_the_next_turn(store):
     ]
     assert [r["voice"] for r in call.tts_requests] == ["Alpha.wav", "Beta.wav"]
     assert [m["model"] for m in messages if m["role"] == "assistant"] == ["model-a", "model-b"]
+
+
+ACTED = ["*laughs*", " I can't", " believe it.", " *smiles*", " Well done.", " *sighs*"]
+ACTED_TEXT = "*laughs* I can't believe it. *smiles* Well done. *sighs*"
+
+
+async def test_actions_are_voiced_as_sounds_and_kept_as_written(store):
+    session = await store.create_session("model-a", "Alpha.wav", "", expressions=True)
+    async with Call(store, session, [], [ACTED]) as call:
+        await call.say("Tell me")
+        messages = await call.wait_for_messages(2)
+    spoken = " ".join(r["input"].strip() for r in call.tts_requests)
+    # Only the actions Chatterbox has a sound for change, and only in the request.
+    assert spoken == "[laugh] I can't believe it. *smiles* Well done. [sigh]"
+    assert messages[1]["content"] == ACTED_TEXT
+
+
+async def test_actions_are_read_as_written_by_default(store):
+    session = await store.create_session("model-a", "Alpha.wav", "")
+    async with Call(store, session, [], [ACTED]) as call:
+        await call.say("Tell me")
+        messages = await call.wait_for_messages(2)
+    assert " ".join(r["input"].strip() for r in call.tts_requests) == ACTED_TEXT
+    assert messages[1]["content"] == ACTED_TEXT
+
+
+async def test_expressions_can_be_switched_during_a_call(store):
+    session = await store.create_session("model-a", "Alpha.wav", "")
+    async with Call(store, session, [], [["*sighs* One."], ["*sighs* Two."]]) as call:
+        await call.say("First")
+        await call.wait_for_messages(2)
+        call.tts.expressions = True
+        await call.say("Second")
+        await call.wait_for_messages(4)
+    assert [r["input"].strip() for r in call.tts_requests] == ["*sighs* One.", "[sigh] Two."]
 
 
 def test_settings_frames_only_for_changed_services():

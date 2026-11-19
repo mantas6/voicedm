@@ -5,6 +5,10 @@ per request (``wav``, ``mp3`` or ``opus``; no raw PCM), so this service asks for
 ``wav`` once per sentence, parses the RIFF header and yields 16-bit PCM frames.
 Pipecat's sentence aggregation feeds it text, and the base class resamples the
 frames if the server's rate differs from the pipeline's output rate.
+
+With ``expressions`` on, actions the model wrote such as ``*laughs*`` go to the server
+as its sound tags (``[laugh]``). Only the request changes: the text the pipeline
+records as spoken, and so the transcript and the history, stay as the model wrote it.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ from pipecat.frames.frames import ErrorFrame, Frame, TTSAudioRawFrame
 from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import TTSService
 
+from voicedm.expressions import with_sound_tags
 from voicedm.upstream import CHATTERBOX, UpstreamError, error_detail, explain
 
 SPEECH_PATH = "/v1/audio/speech"
@@ -80,6 +85,7 @@ class ChatterboxTTSService(TTSService):
         client: httpx.AsyncClient,
         timeout: float = 120.0,
         model: str = "chatterbox",
+        expressions: bool = False,
         **kwargs,
     ) -> None:
         settings = self.Settings(model=model, voice=voice, language=None)
@@ -94,6 +100,8 @@ class ChatterboxTTSService(TTSService):
         self._url = f"{base_url.rstrip('/')}{SPEECH_PATH}"
         self._client = client
         self._timeout = timeout
+        # Whether actions such as *laughs* are sent as sound tags; may change mid-call.
+        self.expressions = expressions
         # Sentences that failed since the last one that was spoken. Counted here
         # because Pipecat's own count of replies without audio only moves once a
         # reply's audio context times out, which is ``stop_frame_timeout_s`` later.
@@ -108,6 +116,8 @@ class ChatterboxTTSService(TTSService):
         Raises ``UpstreamError`` if the request fails and ``WavError`` if the audio
         cannot be used.
         """
+        if self.expressions:
+            text = with_sound_tags(text)
         body = {
             "model": self._settings.model,
             "input": text,

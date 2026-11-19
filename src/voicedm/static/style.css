@@ -255,6 +255,30 @@ body {
   grid-column: 1 / -1;
 }
 
+.settings-body .check {
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 0.5rem;
+  font-size: 0.9rem;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.check input {
+  flex: none;
+  width: 1.05rem;
+  height: 1.05rem;
+  margin: 0.15rem 0 0;
+  accent-color: var(--accent);
+}
+
+.check small {
+  display: block;
+  margin-top: 0.15rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
 select,
 textarea {
   width: 100%;

@@ -22,7 +22,7 @@ def test_fresh_database_gets_the_schema(tmp_path):
     columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
     assert columns == {
         "id", "title", "created_at", "updated_at", "model", "voice", "system_prompt",
-        "summary", "summary_upto",
+        "summary", "summary_upto", "expressions",
     }  # fmt: skip
     columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
     assert columns == {
@@ -150,6 +150,17 @@ async def test_update_session(store):
         await store.update_session(session["id"], summary="no")
 
 
+async def test_expressions_are_off_unless_set_and_read_back_as_a_flag(store):
+    plain = await store.create_session("m", "v", "p")
+    assert plain["expressions"] is False
+    assert (await store.create_session("m", "v", "p", expressions=True))["expressions"] is True
+    assert (await store.update_session(plain["id"], expressions=True))["expressions"] is True
+    assert (await store.get_session(plain["id"]))["expressions"] is True
+    assert (await store.latest_session())["expressions"] is True
+    assert {s["expressions"] for s in await store.list_sessions()} == {True}
+    assert (await store.update_session(plain["id"], expressions=False))["expressions"] is False
+
+
 async def test_summary_and_messages_after_it(store):
     session = await store.create_session("m", "v", "p")
     sid = session["id"]
@@ -208,14 +219,18 @@ def test_version_1_database_is_rebuilt_with_its_data(tmp_path, monkeypatch):
             " VALUES (?, ?, 'user', 'hi', 't')",
             (mid, sid),
         )
-    before = conn.execute("SELECT * FROM sessions ORDER BY id").fetchall()
+    columns = (
+        "id, title, created_at, updated_at, model, voice, system_prompt, summary, summary_upto"
+    )
+    before = conn.execute(f"SELECT {columns} FROM sessions ORDER BY id").fetchall()
     conn.close()
     monkeypatch.undo()
 
     s = Storage(path)  # migrates to the current version
     assert s.version == len(MIGRATIONS)
     conn = sqlite3.connect(path)
-    assert conn.execute("SELECT * FROM sessions ORDER BY id").fetchall() == before
+    assert conn.execute(f"SELECT {columns} FROM sessions ORDER BY id").fetchall() == before
+    assert conn.execute("SELECT DISTINCT expressions FROM sessions").fetchall() == [(0,)]
     assert conn.execute("SELECT id, session_id FROM messages ORDER BY id").fetchall() == [
         (1, 1),
         (2, 5),

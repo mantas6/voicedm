@@ -68,9 +68,13 @@ MIGRATIONS: list[str] = [
     DROP TABLE sessions;
     ALTER TABLE sessions_new RENAME TO sessions;
     """,
+    # Whether actions such as *laughs* are voiced as sounds (see ``expressions``).
+    """
+    ALTER TABLE sessions ADD COLUMN expressions INTEGER NOT NULL DEFAULT 0;
+    """,
 ]
 
-SESSION_FIELDS = ("title", "model", "voice", "system_prompt")
+SESSION_FIELDS = ("title", "model", "voice", "system_prompt", "expressions")
 
 
 def now() -> str:
@@ -84,6 +88,10 @@ def auto_title(text: str) -> str:
     if len(text) <= TITLE_LENGTH:
         return text
     return text[: TITLE_LENGTH - 1].rsplit(" ", 1)[0].rstrip(",.;:") + "…"
+
+
+def session_from(row: sqlite3.Row) -> dict:
+    return {**dict(row), "expressions": bool(row["expressions"])}
 
 
 def migrate(conn: sqlite3.Connection) -> int:
@@ -139,14 +147,17 @@ class Storage:
 
     def _get_session(self, session_id: int) -> dict | None:
         row = self._conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
-        return dict(row) if row else None
+        return session_from(row) if row else None
 
-    def _create_session(self, model: str, voice: str, system_prompt: str) -> dict:
+    def _create_session(
+        self, model: str, voice: str, system_prompt: str, expressions: bool
+    ) -> dict:
         stamp = now()
         cursor = self._conn.execute(
-            "INSERT INTO sessions (created_at, updated_at, model, voice, system_prompt)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (stamp, stamp, model, voice, system_prompt),
+            "INSERT INTO sessions"
+            " (created_at, updated_at, model, voice, system_prompt, expressions)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (stamp, stamp, model, voice, system_prompt, int(expressions)),
         )
         return self._get_session(cursor.lastrowid)
 
@@ -174,7 +185,7 @@ class Storage:
             "SELECT s.*, (SELECT count(*) FROM messages m WHERE m.session_id = s.id)"
             " AS message_count FROM sessions s ORDER BY s.updated_at DESC, s.id DESC"
         )
-        return [dict(row) for row in rows]
+        return [session_from(row) for row in rows]
 
     async def get_session(self, session_id: int) -> dict | None:
         return await self._run(self._get_session, session_id)
@@ -186,15 +197,18 @@ class Storage:
             row = self._conn.execute(
                 "SELECT * FROM sessions ORDER BY updated_at DESC, id DESC LIMIT 1"
             ).fetchone()
-            return dict(row) if row else None
+            return session_from(row) if row else None
 
         return await self._run(latest)
 
-    async def create_session(self, model: str, voice: str, system_prompt: str) -> dict:
-        return await self._run(self._create_session, model, voice, system_prompt)
+    async def create_session(
+        self, model: str, voice: str, system_prompt: str, *, expressions: bool = False
+    ) -> dict:
+        return await self._run(self._create_session, model, voice, system_prompt, expressions)
 
     async def update_session(self, session_id: int, **changes: Any) -> dict | None:
-        """Change some of title, model, voice and system prompt. None if no such session."""
+        """Change some of title, model, voice, system prompt and expressions. None if no
+        such session."""
         return await self._run(self._update_session, session_id, changes)
 
     async def delete_session(self, session_id: int) -> bool:

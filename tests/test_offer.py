@@ -91,8 +91,13 @@ def test_patch_during_a_call_reaches_the_pipeline(offer):
         client.patch(f"/api/sessions/{session_id}", json={"voice": "Beta.wav", "title": "x"})
         client.patch(f"/api/sessions/{session_id}", json={"system_prompt": ""})
         client.patch(f"/api/sessions/{session_id}", json={"title": "only a title"})
+        client.patch(f"/api/sessions/{session_id}", json={"expressions": True})
         client.patch(f"/api/sessions/{other}", json={"model": "second-model:7b"})
-    assert bot.settings_changes == [{"voice": "Beta.wav"}, {"system_prompt": ""}]
+    assert bot.settings_changes == [
+        {"voice": "Beta.wav"},
+        {"system_prompt": ""},
+        {"expressions": True},
+    ]
 
 
 def test_session_in_a_call_cannot_be_deleted(offer):

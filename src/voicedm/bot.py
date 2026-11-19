@@ -6,7 +6,7 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import openai
 from loguru import logger
@@ -288,7 +288,7 @@ class TurnRecorder:
                     await self._on_save_error()
 
 
-def settings_frames(changes: dict[str, str]) -> list[Frame]:
+def settings_frames(changes: dict[str, Any]) -> list[Frame]:
     """Update-settings frames for changed session settings, to queue into a running call.
 
     The LLM and TTS services apply them when the frames reach them, between turns.
@@ -482,6 +482,7 @@ class Bot:
             voice=voice,
             client=upstreams.client,
             timeout=config.tts_timeout,
+            expressions=session["expressions"],
         )
         aggregators = LLMContextAggregatorPair(
             context,
@@ -548,10 +549,12 @@ class Bot:
             await asyncio.sleep(END_MESSAGE_GRACE)  # let the message go out first
             await worker.cancel(reason=reason)
 
-        async def update_settings(changes: dict[str, str]) -> None:
+        async def update_settings(changes: dict[str, Any]) -> None:
+            logger.info(f"Call {pc_id}: settings changed: {sorted(changes)}")
+            if "expressions" in changes:
+                tts.expressions = changes["expressions"]
             frames = settings_frames(changes)
             if frames:
-                logger.info(f"Call {pc_id}: settings changed: {sorted(changes)}")
                 await worker.queue_frames(frames)
             if "model" in changes:
                 # Pipecat writes the LLM service off after an error such as a missing

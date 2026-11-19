@@ -124,14 +124,15 @@ transport.input()
 
 ### Settings and mid-call changes
 
-Each session stores its own model, voice and system prompt. The UI can change them at
-any time:
+Each session stores its own model, voice, system prompt and whether actions are voiced
+as sounds (below). The UI can change them at any time:
 
 - Between calls, the new values apply to the next call.
 - During a call, the server pushes Pipecat update-settings frames (LLM model and system
   instruction, TTS voice) into the running pipeline. These take effect from the next
   turn. (The system prompt is the LLM service's `system_instruction` setting, not a
   message in the context: Pipecat deprecates system messages in `LLMContext`.)
+  Voicing actions as sounds switches from the next sentence.
 
 The model list comes from Ollama `/api/tags` and the voice list from Chatterbox
 `/v1/audio/voices`. Both are proxied by the server so the browser only talks to voicedm.
@@ -141,6 +142,27 @@ one it shows), else of the most recently used session. The very first session ge
 `VOICEDM_DEFAULT_MODEL` / `VOICEDM_DEFAULT_VOICE` (or the first installed model and first
 listed voice) and a built-in default system prompt. An empty system prompt is a valid
 value: no system message.
+
+### Actions as sounds
+
+Chatterbox's Turbo model voices nine tags as the sound itself: `[laugh]`, `[chuckle]`,
+`[sigh]`, `[gasp]`, `[cough]`, `[clear throat]`, `[sniff]`, `[groan]` and `[shush]`.
+Models rarely write such tags when told to, but many write actions between asterisks
+unasked (`*laughs*`), which Chatterbox reads aloud as words.
+
+With the session's `expressions` setting on (off by default), the text sent to
+Chatterbox has each such action replaced by its tag:
+
+- Only an action between single asterisks, of at most four words, that names one of the
+  nine sounds: `*laughs*`, `*giggles*`, `*sighs softly*`, `*clears her throat*`,
+  `*moans*` (`[groan]`), `*shhh*`.
+- Everything else stays exactly as it is: actions with no matching sound (`*smiles*`),
+  longer actions, `**bold**`, and any other text.
+- Only the request to Chatterbox changes. The transcript, the stored messages and the
+  LLM context keep the text as the model wrote it.
+
+With another Chatterbox model the tags are read aloud as words, so the setting is only
+useful with Turbo.
 
 ## Storage
 
@@ -157,7 +179,8 @@ sessions (
   voice         TEXT NOT NULL,
   system_prompt TEXT NOT NULL,
   summary       TEXT NOT NULL DEFAULT '',
-  summary_upto  INTEGER          -- last message id folded into the summary
+  summary_upto  INTEGER,         -- last message id folded into the summary
+  expressions   INTEGER NOT NULL DEFAULT 0  -- voice actions such as *laughs* as sounds
 )
 
 messages (
@@ -259,7 +282,7 @@ The budget and the summary prompt are config values, so they can be tuned per mo
 | `GET` | `/api/sessions` | List sessions |
 | `POST` | `/api/sessions` | New session (copies the current settings; body `{"copy_from": id}` optional) |
 | `GET` | `/api/sessions/{id}` | Session with settings and messages |
-| `PATCH` | `/api/sessions/{id}` | Change model, voice, system prompt or title |
+| `PATCH` | `/api/sessions/{id}` | Change model, voice, system prompt, `expressions` or title |
 | `DELETE` | `/api/sessions/{id}` | Delete the session and its messages; 409 while it is in a call |
 | `POST` | `/api/offer` | WebRTC offer/answer for a call on a session (`session_id` in the body) |
 | `GET` | `/api/health` | Liveness, plus reachability of Ollama and Chatterbox |
@@ -287,7 +310,8 @@ can switch to Pipecat's JS client SDK vendored as ES modules.
 
 - Session list, new session, and deleting a session after a confirmation dialog.
   Deleting the last session leaves a new empty one with the same settings.
-- Model, voice and system prompt controls for the current session.
+- Model, voice, system prompt and "voice actions as sounds" controls for the current
+  session.
 - Call / Hang up button with state: connecting, warming up, listening, thinking,
   speaking.
 - Live transcript, plus history loaded from the API. The bot's reply shows as the LLM
@@ -360,6 +384,7 @@ src/voicedm/
   app.py                   FastAPI routes, static files
   bot.py                   Pipecat pipeline per call
   tts_chatterbox.py
+  expressions.py           actions such as *laughs* to Chatterbox sound tags
   storage.py               SQLite access and migrations
   memory.py                prompt layout, summary folding
   upstream.py              Ollama and Chatterbox listing, health, warm-up

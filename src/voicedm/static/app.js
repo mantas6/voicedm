@@ -15,6 +15,7 @@ const els = {
   settingsSummary: $("settings-summary"),
   model: $("model"),
   voice: $("voice"),
+  expressions: $("expressions"),
   prompt: $("system-prompt"),
   savePrompt: $("save-prompt"),
   settingsNote: $("settings-note"),
@@ -329,6 +330,7 @@ function renderSettings() {
   const s = state.session;
   fillSelect(els.model, state.models, s.model, shortModel);
   fillSelect(els.voice, state.voices, s.voice, shortVoice);
+  els.expressions.checked = s.expressions;
   if (document.activeElement !== els.prompt) els.prompt.value = s.system_prompt;
   els.savePrompt.disabled = els.prompt.value === s.system_prompt;
   els.settingsSummary.textContent = `${shortModel(s.model)} · ${shortVoice(s.voice)}`;
@@ -371,7 +373,8 @@ async function patchSession(changes) {
     if (!inCall()) state.session.messages = messages;
     renderSettings();
     await loadSessions();
-    if (inCall() && ("model" in changes || "voice" in changes || "system_prompt" in changes)) {
+    const settings = ["model", "voice", "system_prompt", "expressions"];
+    if (inCall() && settings.some((name) => name in changes)) {
       els.settingsNote.textContent = "Saved; applies from the next turn.";
     }
   } catch (err) {
@@ -1008,6 +1011,9 @@ els.confirm.addEventListener("click", (event) => {
 
 els.model.addEventListener("change", () => patchSession({ model: els.model.value }));
 els.voice.addEventListener("change", () => patchSession({ voice: els.voice.value }));
+els.expressions.addEventListener("change", () =>
+  patchSession({ expressions: els.expressions.checked }),
+);
 els.prompt.addEventListener("input", () => {
   els.savePrompt.disabled = els.prompt.value === state.session?.system_prompt;
 });
