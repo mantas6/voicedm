@@ -95,6 +95,19 @@ def test_patch_during_a_call_reaches_the_pipeline(offer):
     assert bot.settings_changes == [{"voice": "Beta.wav"}, {"system_prompt": ""}]
 
 
+def test_session_in_a_call_cannot_be_deleted(offer):
+    client, bot = client_for()
+    with client:
+        session_id = new_session(client)
+        other = new_session(client)
+        client.post("/api/offer", json={**offer, "session_id": session_id})
+        response = client.delete(f"/api/sessions/{session_id}")
+        assert response.status_code == 409
+        assert "Hang up" in response.json()["detail"]
+        assert client.get(f"/api/sessions/{session_id}").status_code == 200
+        assert client.delete(f"/api/sessions/{other}").status_code == 204  # others can go
+
+
 def test_configured_defaults_are_used_without_listing():
     def handler(request: httpx.Request) -> httpx.Response:
         raise AssertionError(f"unexpected request {request.url}")

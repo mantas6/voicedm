@@ -65,6 +65,16 @@
         </footer>
       </main>
     </div>
+    <dialog id="confirm" class="dialog" aria-labelledby="confirm-title">
+      <form method="dialog">
+        <h2 id="confirm-title">Delete session?</h2>
+        <p id="confirm-text"></p>
+        <div class="dialog-actions">
+          <button value="cancel" class="button" autofocus>Cancel</button>
+          <button value="confirm" class="button danger">Delete</button>
+        </div>
+      </form>
+    </dialog>
     <audio id="remote" autoplay></audio>
     <script src="app.js"></script>
   </body>

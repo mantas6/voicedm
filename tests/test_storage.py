@@ -163,3 +163,78 @@ async def test_summary_and_messages_after_it(store):
     assert [m["content"] for m in await store.messages(sid, after=ids[1])] == ["m2", "m3"]
     assert len(await store.messages(sid)) == 4  # folded messages stay
     assert len(await store.messages(sid, after=None)) == 4
+
+
+async def test_delete_session_removes_it_with_its_messages(store):
+    keep = await store.create_session("m", "v", "p")
+    gone = await store.create_session("m", "v", "p")
+    await store.add_message(keep["id"], "user", "stays")
+    await store.add_message(gone["id"], "user", "goes")
+    await store.add_message(gone["id"], "assistant", "goes too", model="m")
+    assert await store.delete_session(gone["id"]) is True
+    assert await store.get_session(gone["id"]) is None
+    assert await store.messages(gone["id"]) == []
+    assert [s["id"] for s in await store.list_sessions()] == [keep["id"]]
+    assert [m["content"] for m in await store.messages(keep["id"])] == ["stays"]
+    assert await store.delete_session(gone["id"]) is False  # already gone
+    assert await store.delete_session(999) is False
+
+
+async def test_session_ids_are_never_reused(store):
+    first = await store.create_session("m", "v", "p")
+    last = await store.create_session("m", "v", "p")
+    await store.delete_session(last["id"])
+    new = await store.create_session("m", "v", "p")
+    assert new["id"] > last["id"]
+    await store.delete_session(first["id"])
+    await store.delete_session(new["id"])
+    assert (await store.create_session("m", "v", "p"))["id"] > new["id"]  # even when empty
+
+
+def test_version_1_database_is_rebuilt_with_its_data(tmp_path, monkeypatch):
+    path = tmp_path / "test.db"
+    conn = sqlite3.connect(path, isolation_level=None)
+    monkeypatch.setattr(storage, "MIGRATIONS", MIGRATIONS[:1])
+    assert migrate(conn) == 1
+    for sid, title in ((1, "one"), (2, None), (5, "five")):
+        conn.execute(
+            "INSERT INTO sessions (id, title, created_at, updated_at, model, voice,"
+            " system_prompt, summary, summary_upto) VALUES (?, ?, 'c', 'u', 'm', 'v', '', 's', 3)",
+            (sid, title),
+        )
+    for mid, sid in ((1, 1), (2, 5), (3, 5)):
+        conn.execute(
+            "INSERT INTO messages (id, session_id, role, content, created_at)"
+            " VALUES (?, ?, 'user', 'hi', 't')",
+            (mid, sid),
+        )
+    before = conn.execute("SELECT * FROM sessions ORDER BY id").fetchall()
+    conn.close()
+    monkeypatch.undo()
+
+    s = Storage(path)  # migrates to the current version
+    assert s.version == len(MIGRATIONS)
+    conn = sqlite3.connect(path)
+    assert conn.execute("SELECT * FROM sessions ORDER BY id").fetchall() == before
+    assert conn.execute("SELECT id, session_id FROM messages ORDER BY id").fetchall() == [
+        (1, 1),
+        (2, 5),
+        (3, 5),
+    ]
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
+    assert "sessions_new" not in tables
+    assert "messages_session" in tables  # the index survived
+    conn.close()
+    # Foreign keys are enforced again, and new ids continue after the highest old one.
+    with pytest.raises(sqlite3.IntegrityError):
+        s._conn.execute(
+            "INSERT INTO messages (session_id, role, content, created_at)"
+            " VALUES (999, 'user', 'orphan', 't')"
+        )
+    new_id = s._conn.execute(
+        "INSERT INTO sessions (created_at, updated_at, model, voice, system_prompt)"
+        " VALUES ('c', 'u', 'm', 'v', '')"
+    ).lastrowid
+    assert new_id == 6
+    s.close()

@@ -292,6 +292,16 @@ def create_app(
         messages = await store.messages(session_id)
         return {**with_call_state(session), "messages": messages}
 
+    @app.delete("/api/sessions/{session_id}", status_code=204)
+    async def delete_session(request: Request, session_id: int) -> None:
+        """Delete a session and its messages for good; not while a call runs on it."""
+        await existing_session(request, session_id)
+        if active_call(session_id):
+            raise HTTPException(
+                status_code=409, detail="This session is in a call. Hang up before deleting it."
+            )
+        await store_of(request).delete_session(session_id)
+
     @app.post("/api/offer")
     async def offer(request: Request, body: Offer) -> dict[str, Any]:
         """Start a call on a session: the SDP answer to the page's offer.

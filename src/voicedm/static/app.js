@@ -25,6 +25,8 @@ const els = {
   call: $("call"),
   remote: $("remote"),
   notices: $("notices"),
+  confirm: $("confirm"),
+  confirmText: $("confirm-text"),
 };
 
 // Pause after "bot stopped speaking" before showing "Listening": the server reports
@@ -199,12 +201,22 @@ function renderNotices() {
 
 // -- sessions --
 
+const TRASH_ICON =
+  '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" ' +
+  'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-12M9 7V4h6v3"/>' +
+  "</svg>";
+
+function messageCount(session) {
+  return session.message_count === 1 ? "1 message" : `${session.message_count} messages`;
+}
+
 function renderSessions() {
   els.sessions.replaceChildren();
   for (const session of state.sessions) {
-    const button = el("button");
+    const button = el("button", "session-select");
     button.type = "button";
-    const meta = `${session.message_count} messages · ${relativeTime(session.updated_at)}`;
+    const meta = `${messageCount(session)} · ${relativeTime(session.updated_at)}`;
     button.append(
       el("span", "session-title", session.title || "Untitled session"),
       el("span", "session-meta", session.in_call ? `${meta} · in a call` : meta),
@@ -216,8 +228,15 @@ function renderSessions() {
       closeDrawer();
       if (!current) selectSession(session.id);
     });
-    const item = el("li");
-    item.append(button);
+    const remove = el("button", "session-delete");
+    remove.type = "button";
+    remove.innerHTML = TRASH_ICON;
+    remove.title = "Delete session";
+    remove.setAttribute("aria-label", `Delete session “${session.title || "Untitled session"}”`);
+    remove.disabled = inCall();
+    remove.addEventListener("click", () => deleteSession(session));
+    const item = el("li", current ? "current" : "");
+    item.append(button, remove);
     els.sessions.append(item);
   }
   els.newSession.disabled = inCall();
@@ -251,6 +270,45 @@ async function newSession() {
   } catch (err) {
     setCallState("error", `New session failed: ${err.message}`);
   }
+}
+
+// Ask before deleting; resolves to true only on an explicit "Delete".
+function confirmDelete(session) {
+  const name = `“${session.title || "Untitled session"}”`;
+  const what = session.message_count ? `${name} and its ${messageCount(session)}` : name;
+  const text = `${what} will be deleted for good. This cannot be undone.`;
+  if (typeof els.confirm.showModal !== "function") {
+    return Promise.resolve(window.confirm(`Delete session?\n\n${text}`));
+  }
+  els.confirmText.textContent = text;
+  els.confirm.returnValue = "cancel"; // what Escape and the backdrop leave behind
+  els.confirm.showModal();
+  return new Promise((resolve) => {
+    els.confirm.addEventListener("close", () => resolve(els.confirm.returnValue === "confirm"), {
+      once: true,
+    });
+  });
+}
+
+async function deleteSession(session) {
+  if (inCall() || !(await confirmDelete(session))) return;
+  try {
+    const wasCurrent = state.session?.id === session.id;
+    // Never leave the list empty: the replacement keeps the deleted session's settings.
+    let next = state.sessions.find((s) => s.id !== session.id)?.id;
+    if (wasCurrent && next === undefined) {
+      next = (await api("POST", "/api/sessions", { copy_from: session.id })).id;
+    }
+    await api("DELETE", `/api/sessions/${session.id}`);
+    setNotice("sessions", "error", null);
+    if (wasCurrent) {
+      state.session = null;
+      await selectSession(next);
+    }
+  } catch (err) {
+    setNotice("sessions", "error", `Could not delete the session: ${err.message}`);
+  }
+  await loadSessions().catch(() => {});
 }
 
 // -- settings --
@@ -943,6 +1001,10 @@ els.mute.addEventListener("click", () => {
 els.newSession.addEventListener("click", newSession);
 els.menu.addEventListener("click", openDrawer);
 els.scrim.addEventListener("click", closeDrawer);
+// A click on the backdrop (the dialog element itself, outside its form) cancels.
+els.confirm.addEventListener("click", (event) => {
+  if (event.target === els.confirm) els.confirm.close("cancel");
+});
 
 els.model.addEventListener("change", () => patchSession({ model: els.model.value }));
 els.voice.addEventListener("change", () => patchSession({ voice: els.voice.value }));

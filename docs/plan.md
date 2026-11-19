@@ -149,7 +149,7 @@ Queries run in a worker thread (`asyncio.to_thread`) so they never block the eve
 
 ```sql
 sessions (
-  id            INTEGER PRIMARY KEY,
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,  -- never reused after a delete
   title         TEXT,
   created_at    TEXT NOT NULL,
   updated_at    TEXT NOT NULL,
@@ -182,7 +182,10 @@ messages (
 - A session's title is the start of its first user message, unless set via the API.
 - Schema changes go through numbered migrations, applied at startup. The applied
   version is SQLite's `user_version`; each migration runs in its own transaction.
-- "New session" never deletes anything. Deleting sessions is a later feature.
+- "New session" never deletes anything. A session is only deleted on request
+  (`DELETE /api/sessions/{id}`), together with all its messages and for good; a session
+  with a call running on it cannot be deleted. Session ids are never reused, so a page
+  still open on a deleted session gets "not found" instead of another session.
 
 ## Memory
 
@@ -257,6 +260,7 @@ The budget and the summary prompt are config values, so they can be tuned per mo
 | `POST` | `/api/sessions` | New session (copies the current settings; body `{"copy_from": id}` optional) |
 | `GET` | `/api/sessions/{id}` | Session with settings and messages |
 | `PATCH` | `/api/sessions/{id}` | Change model, voice, system prompt or title |
+| `DELETE` | `/api/sessions/{id}` | Delete the session and its messages; 409 while it is in a call |
 | `POST` | `/api/offer` | WebRTC offer/answer for a call on a session (`session_id` in the body) |
 | `GET` | `/api/health` | Liveness, plus reachability of Ollama and Chatterbox |
 
@@ -281,7 +285,8 @@ Plain HTML, CSS and JavaScript served by the app, with no build step. It talks t
 `RTCPeerConnection` and the RTVI data-channel messages directly. If that gets awkward, it
 can switch to Pipecat's JS client SDK vendored as ES modules.
 
-- Session list, new session.
+- Session list, new session, and deleting a session after a confirmation dialog.
+  Deleting the last session leaves a new empty one with the same settings.
 - Model, voice and system prompt controls for the current session.
 - Call / Hang up button with state: connecting, warming up, listening, thinking,
   speaking.

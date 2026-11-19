@@ -45,6 +45,29 @@ MIGRATIONS: list[str] = [
     );
     CREATE INDEX messages_session ON messages(session_id, id);
     """,
+    # Sessions can be deleted, so their ids must never be handed out again: a page
+    # still open on a deleted session has to get "not found", not someone else's
+    # session. SQLite only takes AUTOINCREMENT at table creation, hence the rebuild.
+    """
+    CREATE TABLE sessions_new (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      title         TEXT,
+      created_at    TEXT NOT NULL,
+      updated_at    TEXT NOT NULL,
+      model         TEXT NOT NULL,
+      voice         TEXT NOT NULL,
+      system_prompt TEXT NOT NULL,
+      summary       TEXT NOT NULL DEFAULT '',
+      summary_upto  INTEGER
+    );
+    INSERT INTO sessions_new
+      (id, title, created_at, updated_at, model, voice, system_prompt, summary, summary_upto)
+      SELECT id, title, created_at, updated_at, model, voice, system_prompt, summary,
+             summary_upto
+      FROM sessions;
+    DROP TABLE sessions;
+    ALTER TABLE sessions_new RENAME TO sessions;
+    """,
 ]
 
 SESSION_FIELDS = ("title", "model", "voice", "system_prompt")
@@ -64,7 +87,11 @@ def auto_title(text: str) -> str:
 
 
 def migrate(conn: sqlite3.Connection) -> int:
-    """Apply the migrations the database has not seen yet; return the schema version."""
+    """Apply the migrations the database has not seen yet; return the schema version.
+
+    Runs with foreign key enforcement off (SQLite's default for a new connection), which
+    migrations that rebuild a table rely on.
+    """
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     if version > len(MIGRATIONS):
         raise RuntimeError(
@@ -90,8 +117,8 @@ class Storage:
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
         self._conn.execute("PRAGMA journal_mode = WAL")
+        self.version = migrate(self._conn)  # before foreign keys are enforced
         self._conn.execute("PRAGMA foreign_keys = ON")
-        self.version = migrate(self._conn)
 
     @classmethod
     def in_dir(cls, data_dir: Path) -> Storage:
@@ -135,6 +162,13 @@ class Storage:
             )
         return self._get_session(session_id)
 
+    def _delete_session(self, session_id: int) -> bool:
+        with self._conn:  # one transaction: the session goes with all its messages
+            self._conn.execute("BEGIN")
+            self._conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            cursor = self._conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        return cursor.rowcount > 0
+
     def _list_sessions(self) -> list[dict]:
         rows = self._conn.execute(
             "SELECT s.*, (SELECT count(*) FROM messages m WHERE m.session_id = s.id)"
@@ -162,6 +196,10 @@ class Storage:
     async def update_session(self, session_id: int, **changes: Any) -> dict | None:
         """Change some of title, model, voice and system prompt. None if no such session."""
         return await self._run(self._update_session, session_id, changes)
+
+    async def delete_session(self, session_id: int) -> bool:
+        """Delete a session and its messages for good. False if no such session."""
+        return await self._run(self._delete_session, session_id)
 
     async def list_sessions(self) -> list[dict]:
         """All sessions, most recently used first, with their message counts."""

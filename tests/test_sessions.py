@@ -128,3 +128,23 @@ def test_patch_rejects_bad_fields():
             {"title": "x" * 201},
         ):
             assert client.patch(f"/api/sessions/{sid}", json=body).status_code == 422, body
+
+
+def test_delete_removes_the_session_and_its_messages():
+    with client_for() as client:
+        keep = client.post("/api/sessions").json()["id"]
+        gone = client.post("/api/sessions").json()["id"]
+        store = client.app.state.store
+        client.portal.call(store.add_message, keep, "user", "stays")
+        client.portal.call(store.add_message, gone, "user", "goes")
+        response = client.delete(f"/api/sessions/{gone}")
+        assert response.status_code == 204
+        assert response.content == b""
+        assert client.get(f"/api/sessions/{gone}").status_code == 404
+        assert [s["id"] for s in client.get("/api/sessions").json()] == [keep]
+        assert [m["content"] for m in client.get(f"/api/sessions/{keep}").json()["messages"]] == [
+            "stays"
+        ]
+        assert client.portal.call(store.messages, gone) == []
+        assert client.delete(f"/api/sessions/{gone}").status_code == 404  # already gone
+        assert client.delete("/api/sessions/999").status_code == 404

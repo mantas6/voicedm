@@ -93,30 +93,55 @@ body {
   overflow-y: auto;
 }
 
-.sessions button {
-  display: block;
-  width: 100%;
-  padding: 0.55rem 0.65rem;
-  border: 0;
+.sessions li {
+  display: flex;
+  align-items: center;
   border-radius: 8px;
-  background: none;
-  color: inherit;
-  font: inherit;
-  text-align: left;
-  cursor: pointer;
 }
 
-.sessions button:hover:not(:disabled) {
+.sessions li:hover {
   background: var(--bg);
 }
 
-.sessions button[aria-current="true"] {
+.sessions li.current {
   background: var(--user-bubble);
+}
+
+.sessions button {
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
 }
 
 .sessions button:disabled {
   cursor: default;
   opacity: 0.6;
+}
+
+.sessions .session-select {
+  flex: 1;
+  min-width: 0;
+  padding: 0.55rem 0.25rem 0.55rem 0.65rem;
+  border-radius: 8px;
+  text-align: left;
+}
+
+.sessions .session-delete {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 2.25rem;
+  height: 2.25rem;
+  margin-right: 0.15rem;
+  border-radius: 6px;
+  color: var(--muted);
+}
+
+.sessions .session-delete:hover:not(:disabled),
+.sessions .session-delete:focus-visible {
+  color: var(--danger);
 }
 
 .sessions .session-title {
@@ -495,6 +520,13 @@ textarea {
   border-color: var(--danger);
 }
 
+.button.danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #ffffff;
+  font-weight: 600;
+}
+
 .icon-button {
   display: grid;
   place-items: center;
@@ -508,6 +540,38 @@ textarea {
 
 .scrim {
   display: none;
+}
+
+/* -- confirmation dialog -- */
+
+.dialog {
+  width: min(24rem, calc(100vw - 2rem));
+  padding: 1.1rem 1.25rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.dialog::backdrop {
+  background: rgb(0 0 0 / 0.45);
+}
+
+.dialog h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1.05rem;
+}
+
+.dialog p {
+  margin: 0 0 1rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
 }
 
 /* -- phone width: the session list becomes a drawer -- */

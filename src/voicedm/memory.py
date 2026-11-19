@@ -15,7 +15,7 @@ When the recent messages grow over the budget (characters of message text), the
 older half is folded into the summary: one separate request to Ollama turns the
 previous summary plus the messages being folded into a new summary, which is stored
 with the id of the last folded message. Then the call switches to the new summary
-and drops the folded messages from its context. Stored messages are never deleted.
+and drops the folded messages from its context. Folding never deletes stored messages.
 
 Folding starts between turns (after a reply, or right after a call connects) and
 never holds up a turn: a turn that starts meanwhile uses the old context. The switch
