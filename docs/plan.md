@@ -327,7 +327,7 @@ Environment variables, set by the NixOS module:
 | `VOICEDM_DATA_DIR` | `./data` | SQLite database and model cache |
 | `VOICEDM_OLLAMA_URL` | `http://localhost:11434` | Ollama base URL |
 | `VOICEDM_CHATTERBOX_URL` | `http://localhost:8004` | Chatterbox TTS server base URL |
-| `VOICEDM_WHISPER_MODEL` | `base.en` | faster-whisper model |
+| `VOICEDM_WHISPER_MODEL` | `base.en` | faster-whisper model name, or a directory holding a converted model |
 | `VOICEDM_DEFAULT_MODEL` | first installed model | Model for new sessions |
 | `VOICEDM_DEFAULT_VOICE` | first listed voice | Voice for new sessions |
 | `VOICEDM_STUN_URL` | unset | Optional STUN server |
@@ -343,9 +343,11 @@ module's `environment` option.
 ## Repository layout
 
 ```
-flake.nix                  package, NixOS module, dev shell
-nix/package.nix
-nix/module.nix
+flake.nix                  package, NixOS module, checks, dev shell
+nix/package.nix            uv2nix build
+nix/module.nix             services.voicedm
+nix/vm-test.nix            NixOS VM test
+nix/upstream_stub.py       fake Ollama and Chatterbox for the VM test
 pyproject.toml, uv.lock
 src/voicedm/
   __main__.py              entry point (uvicorn)
@@ -368,19 +370,45 @@ docs/
   `ffmpeg` and `ruff`, and `LD_LIBRARY_PATH` set for the binary wheels (libstdc++,
   zlib). `scripts/call_client.py` makes a headless test call (aiortc) against a running
   server: it speaks WAV files, can barge in, and records and logs what comes back.
-- **Package:** built from `uv.lock` with uv2nix (pyproject-nix), so the NixOS service
-  uses pinned dependencies. Binary wheels (onnxruntime for Silero, ctranslate2 for
-  faster-whisper, aiortc) may need fix-ups such as `autoPatchelfHook`. If this takes too
-  long, the fallback is a service that runs `uv sync` into its state directory at start;
-  that is less pure but unblocks deployment.
-- **NixOS module** `services.voicedm`:
+- **Package** (`nix/package.nix`): built from `uv.lock` with uv2nix (flake inputs
+  `pyproject-nix`, `uv2nix`, `pyproject-build-systems`), preferring wheels, so the
+  NixOS service uses exactly the pinned dependencies. pyproject.nix patches the
+  binary wheels (onnxruntime, ctranslate2, av, aiortc, numpy, ...) with
+  `autoPatchelfHook` and the manylinux libraries, so no `LD_LIBRARY_PATH` is needed;
+  the only override is `docopt` (an sdist without its setuptools build dependency).
+  `ffmpeg` is not needed at runtime (PyAV bundles its own libraries). The closure is
+  about 1 GB, mostly the wheels' bundled libraries (OpenCV, which Pipecat depends on,
+  ctranslate2, PyAV, onnxruntime, numpy). `nix run .` starts the server.
+- **NixOS module** `services.voicedm` (`nix/module.nix`):
   - `enable`, `package`, `host`, `port`, `openFirewall`
   - `ollamaUrl`, `chatterboxUrl`, `whisperModel`, `stunUrl`
-  - `environment` for extra variables
+  - `whisperModelPath`: a local CTranslate2 Whisper model directory used instead of
+    `whisperModel`, with `HF_HUB_OFFLINE=1`, for hosts without Hugging Face access
+    (and the VM test). `VOICEDM_WHISPER_MODEL` takes a model name or such a directory.
+  - `environment` for extra variables (the memory settings, default model and voice,
+    TTS timeout, log level)
   - systemd service with `DynamicUser`, `StateDirectory=voicedm` (database plus the
-    Hugging Face cache for the Whisper model), and the usual hardening options. The
-    firewall needs the HTTP port and the UDP range aiortc uses for media, unless that
-    range is pinned in config.
+    Whisper model under `models/`), `CacheDirectory=voicedm` for any other library
+    cache (`HF_HOME`, `XDG_CACHE_HOME`), `Restart=on-failure`, and hardening
+    (`systemd-analyze security`: 1.1 "OK"). Two usual options are left off because
+    they break the app: `MemoryDenyWriteExecute` (pyOpenSSL's DTLS verify callback is
+    a cffi callback that needs write+execute memory) and `ProcSubset=pid`
+    (onnxruntime reads `/proc/cpuinfo`). Address families: `AF_INET`, `AF_INET6`,
+    `AF_UNIX`, and `AF_NETLINK` for listing the host's addresses for ICE.
+  - Firewall: aiortc binds each call's media socket to a kernel-chosen ephemeral UDP
+    port and has no setting to pin a range (aioice binds port 0). Rather than patch
+    aioice internals, `openFirewall` opens the HTTP port and the Linux default
+    ephemeral range, UDP 32768-60999; the option description says so, and how to
+    open it on the LAN interface only instead. Without the UDP range a call does not
+    connect through the NixOS firewall (checked in the VM test).
+- **VM test** (`checks.<system>.vm-test`, `nix/vm-test.nix`): a server with the
+  module, its firewall on and `openFirewall`, fake Ollama and Chatterbox
+  (`nix/upstream_stub.py`), and a pinned `faster-whisper-tiny.en` model (about 75 MB,
+  fetched as fixed-output derivations); a client machine checks `/api/health`, the
+  model and voice lists, creating and reading a session, the page, and makes one
+  WebRTC call with `scripts/call_client.py` (a question synthesised with espeak-ng),
+  which must be transcribed, answered and stored. Other checks: the package, `pytest`
+  and `ruff` from the locked environment.
 - **Wiring:** the NixOS configuration that hosts the app adds this flake as an input,
   imports `nixosModules.default`, enables the service and sets the two upstream URLs.
   The repository is private, so the machine that builds that configuration needs read

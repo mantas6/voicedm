@@ -28,7 +28,7 @@ def setup_logging(level: str) -> None:
     logger.add(sys.stderr, level=level, format="{level: <7} {name}: {message}")
     logging.basicConfig(level=level, format="%(levelname)-7s %(name)s: %(message)s")
     if level not in ("TRACE", "DEBUG"):
-        for name in ("uvicorn.access", "httpx", "httpcore", "aioice"):
+        for name in ("uvicorn.access", "httpx", "httpcore", "httpx2", "httpcore2", "aioice"):
             logging.getLogger(name).setLevel(logging.WARNING)
 
 
