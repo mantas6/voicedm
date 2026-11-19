@@ -2,14 +2,20 @@
 
 Usage (server already running):
 
-    uv run python scripts/call_client.py --url http://127.0.0.1:8780 \\
+    uv run python scripts/call_client.py --url http://127.0.0.1:8780 --session 3 \\
         --say question.wav --barge-in interrupt.wav --record reply.wav --duration 60
 
-``--say`` files are spoken one after another from the start of the call (after
-``--delay`` seconds). ``--barge-in`` is spoken ``--barge-in-after`` seconds after the
-bot's audio first starts, to check that talking over the bot stops it. The client
-logs RTVI events from the data channel and when the bot's audio starts and stops,
-with times relative to the start of the call. Input WAVs must be 16-bit PCM.
+The call is on session ``--session``, or on a new session if none is given. ``--say``
+files are spoken one after another from the start of the call (after ``--delay``
+seconds); with ``--wait-reply`` each one after the first waits until the bot has
+answered the previous one (its audio started and then stayed quiet for ``--quiet``
+seconds). ``--patch`` is a JSON body sent as a PATCH to the session after the first
+reply, before the next ``--say``, to check mid-call settings changes. ``--barge-in``
+is spoken ``--barge-in-after`` seconds after the bot's audio first starts, to check
+that talking over the bot stops it. The client logs RTVI events from the data channel
+and when the bot's audio starts and stops, with times relative to the start of the
+call, and prints the session's stored messages at the end. Input WAVs must be 16-bit
+PCM.
 """
 
 from __future__ import annotations
@@ -155,9 +161,9 @@ def on_message(raw: str) -> None:
     except ValueError:
         return
     kind, data = msg.get("type"), msg.get("data") or {}
-    if kind in ("metrics", "bot-tts-text", "bot-llm-text", "bot-output", "user-speaking"):
+    if kind in ("metrics", "bot-llm-text", "bot-output", "user-speaking", "llm-raw-text"):
         return  # too chatty to log
-    if kind in ("user-transcription", "bot-transcription"):
+    if kind in ("user-transcription", "bot-transcription", "bot-tts-text"):
         if kind == "user-transcription" and not data.get("final", True):
             return
         log(f"{kind}: {data.get('text', '').strip()!r}")
@@ -170,8 +176,12 @@ def on_message(raw: str) -> None:
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--url", default="http://127.0.0.1:8780")
+    parser.add_argument("--session", type=int, help="session id (default: a new session)")
     parser.add_argument("--say", type=Path, action="append", default=[])
     parser.add_argument("--delay", type=float, default=2.0, help="seconds before --say")
+    parser.add_argument("--wait-reply", action="store_true", help="say the next after a reply")
+    parser.add_argument("--quiet", type=float, default=3.0, help="silence that ends a reply")
+    parser.add_argument("--patch", type=json.loads, help="JSON PATCH body after the 1st reply")
     parser.add_argument("--barge-in", type=Path)
     parser.add_argument("--barge-in-after", type=float, default=2.0)
     parser.add_argument("--record", type=Path)
@@ -205,20 +215,55 @@ async def main() -> None:
 
     channel.on("message", on_message)
 
+    http = httpx.AsyncClient(base_url=args.url, timeout=30)
+    session_id = args.session
+    if session_id is None:
+        response = await http.post("/api/sessions")
+        response.raise_for_status()
+        session_id = response.json()["id"]
+        log(f"created session {session_id}")
+    session = (await http.get(f"/api/sessions/{session_id}")).raise_for_status().json()
+    log(
+        f"session {session_id}: model {session['model']}, voice {session['voice']}, "
+        f"{len(session['messages'])} earlier messages"
+    )
+
     await pc.setLocalDescription(await pc.createOffer())
-    async with httpx.AsyncClient(timeout=30) as http:
-        response = await http.post(
-            f"{args.url}/api/offer",
-            json={"sdp": pc.localDescription.sdp, "type": pc.localDescription.type},
-        )
+    response = await http.post(
+        "/api/offer",
+        json={
+            "sdp": pc.localDescription.sdp,
+            "type": pc.localDescription.type,
+            "session_id": session_id,
+        },
+    )
     response.raise_for_status()
     answer = response.json()
     await pc.setRemoteDescription(RTCSessionDescription(sdp=answer["sdp"], type=answer["type"]))
     log(f"connected, pc_id {answer.get('pc_id')}")
 
+    async def reply_done(stretches_before: int) -> None:
+        """Wait until bot audio started after ``stretches_before`` and then went quiet."""
+        while True:
+            await asyncio.sleep(0.2)
+            now = time.monotonic() - T0
+            if (
+                len(recorder.stretches) > stretches_before
+                and not recorder.speaking
+                and now - recorder.last_loud > args.quiet
+            ):
+                return
+
     async def speak() -> None:
         await asyncio.sleep(args.delay)
-        for path, samples in says:
+        stretches = 0
+        for number, (path, samples) in enumerate(says):
+            if number and args.wait_reply:
+                await reply_done(stretches)
+            if number == 1 and args.patch is not None:
+                response = await http.patch(f"/api/sessions/{session_id}", json=args.patch)
+                log(f"PATCH {args.patch} -> HTTP {response.status_code}")
+            stretches = len(recorder.stretches)
             mic.say(samples, path.name)
             await asyncio.sleep(len(samples) / RATE + 0.1)
 
@@ -238,6 +283,15 @@ async def main() -> None:
     recorder.save()
     for start, end in recorder.stretches:
         log(f"bot audio stretch {start:.2f}s - {end:.2f}s")
+
+    await asyncio.sleep(1.0)  # let the server save the last turn
+    session = (await http.get(f"/api/sessions/{session_id}")).raise_for_status().json()
+    await http.aclose()
+    log(f"session {session_id} ({session['title']!r}) now has:")
+    for m in session["messages"]:
+        flags = " [interrupted]" if m["interrupted"] else ""
+        model = f" ({m['model']})" if m["model"] else ""
+        print(f"  #{m['id']} {m['role']}{model}{flags}: {m['content']}", flush=True)
 
 
 if __name__ == "__main__":

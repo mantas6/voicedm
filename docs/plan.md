@@ -110,9 +110,16 @@ any time:
 The model list comes from Ollama `/api/tags` and the voice list from Chatterbox
 `/v1/audio/voices`. Both are proxied by the server so the browser only talks to voicedm.
 
+A new session copies the settings of a session named in the request (the page sends the
+one it shows), else of the most recently used session. The very first session gets
+`VOICEDM_DEFAULT_MODEL` / `VOICEDM_DEFAULT_VOICE` (or the first installed model and first
+listed voice) and a built-in default system prompt. An empty system prompt is a valid
+value: no system message.
+
 ## Storage
 
-SQLite in the service's state directory, WAL mode.
+SQLite in the service's state directory (`voicedm.db` in `VOICEDM_DATA_DIR`), WAL mode.
+Queries run in a worker thread (`asyncio.to_thread`) so they never block the event loop.
 
 ```sql
 sessions (
@@ -138,9 +145,17 @@ messages (
 )
 ```
 
-- Messages are saved when the context aggregators finish a turn. For an interrupted
-  reply, only the text that was actually spoken is stored, marked `interrupted`.
-- Schema changes go through numbered migrations, applied at startup.
+- Messages are saved when the context aggregators finish a turn (the user aggregator's
+  `on_user_turn_message_added`, the assistant aggregator's `on_assistant_turn_stopped`).
+  For an interrupted reply, only the text that was actually spoken is stored, marked
+  `interrupted`. That is what the assistant aggregator reports: it sits after the output
+  transport, which releases each sentence's text once its audio has played, so
+  "spoken" means the sentences played to the end. A reply interrupted before its first
+  sentence finished is not stored. Hanging up mid-reply counts as an interruption.
+- Each assistant message stores the model that was set when its reply started.
+- A session's title is the start of its first user message, unless set via the API.
+- Schema changes go through numbered migrations, applied at startup. The applied
+  version is SQLite's `user_version`; each migration runs in its own transaction.
 - "New session" never deletes anything. Deleting sessions is a later feature.
 
 ## Memory
@@ -164,6 +179,9 @@ prompt, so the prompt layout is designed to keep that start stable:
 - Changing the system prompt or model also invalidates the cache. That is expected and
   only costs the next turn.
 
+Until this is built, a call starts from a plain replay of the session's stored messages
+(`memory.build_context`); the memory milestone replaces that function's body.
+
 The budget and the summary prompt are config values, so they can be tuned per model.
 
 ## HTTP API
@@ -174,13 +192,16 @@ The budget and the summary prompt are config values, so they can be tuned per mo
 | `GET` | `/api/models` | Installed Ollama models |
 | `GET` | `/api/voices` | Chatterbox voices |
 | `GET` | `/api/sessions` | List sessions |
-| `POST` | `/api/sessions` | New session (copies the current settings) |
+| `POST` | `/api/sessions` | New session (copies the current settings; body `{"copy_from": id}` optional) |
 | `GET` | `/api/sessions/{id}` | Session with settings and messages |
 | `PATCH` | `/api/sessions/{id}` | Change model, voice, system prompt or title |
-| `POST` | `/api/offer` | WebRTC offer/answer for a call on a session |
+| `POST` | `/api/offer` | WebRTC offer/answer for a call on a session (`session_id` in the body) |
 | `GET` | `/api/health` | Liveness, plus reachability of Ollama and Chatterbox |
 
 Only one call runs at a time. A second offer while a call is active gets HTTP 409.
+Sessions carry `in_call` while a call runs on them. `PATCH` validates its fields (422 for
+unknown fields, nulls, an empty model or voice); a PATCH to the session in a call also
+queues update-settings frames into that call's pipeline.
 
 ## Web UI
 
@@ -192,7 +213,12 @@ can switch to Pipecat's JS client SDK vendored as ES modules.
 - Model, voice and system prompt controls for the current session.
 - Call / Hang up button with state: connecting, warming up, listening, thinking,
   speaking.
-- Live transcript, plus history loaded from the API.
+- Live transcript, plus history loaded from the API. The bot's reply shows as the LLM
+  generates it (`bot-llm-text`), muted until each sentence is reported spoken
+  (`bot-tts-text`); after a call the page reloads the stored messages.
+- The state stays "speaking" while a reply still has unspoken text, and "listening"
+  follows "bot stopped speaking" only after a short delay, because Pipecat reports a
+  stop between sentences whenever synthesis is slower than playback.
 - Mute toggle.
 - Works on a phone-width screen.
 

@@ -7,6 +7,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+# The system prompt of the first session; later sessions copy theirs.
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a friendly voice assistant in a spoken conversation. Your replies are "
+    "read aloud, so answer in plain conversational sentences: no markdown, lists, "
+    "emoji or code. Keep answers short unless asked for detail."
+)
+
 
 @dataclass(frozen=True)
 class Config:

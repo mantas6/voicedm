@@ -2,17 +2,68 @@
 <html lang="en">
   <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <title>voicedm</title>
+    <link rel="icon" href="icon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="style.css">
   </head>
   <body>
-    <main>
-      <h1>voicedm</h1>
-      <button id="call" type="button">Call</button>
-      <p id="status" role="status">Idle</p>
-      <audio id="remote" autoplay></audio>
-    </main>
+    <div class="app">
+      <aside id="sidebar" class="sidebar" aria-label="Sessions">
+        <div class="sidebar-head">
+          <span class="brand"><img src="icon.svg" alt="" width="24" height="24"> voicedm</span>
+          <button id="new-session" type="button" class="button small">New session</button>
+        </div>
+        <ul id="sessions" class="sessions"></ul>
+      </aside>
+      <div id="scrim" class="scrim" hidden></div>
+
+      <main class="main">
+        <header class="topbar">
+          <button id="menu" type="button" class="icon-button" aria-label="Sessions"
+                  aria-controls="sidebar" aria-expanded="false">
+            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+              <path d="M3 6h18M3 12h18M3 18h18" stroke="currentColor" stroke-width="2"
+                    stroke-linecap="round"/>
+            </svg>
+          </button>
+          <input id="title" class="title" type="text" maxlength="200"
+                 placeholder="Untitled session" aria-label="Session title" autocomplete="off">
+        </header>
+
+        <details id="settings" class="settings">
+          <summary><span class="summary-label">Settings</span>
+            <span id="settings-summary" class="muted"></span></summary>
+          <div class="settings-body">
+            <label>Model
+              <select id="model"></select>
+            </label>
+            <label>Voice
+              <select id="voice"></select>
+            </label>
+            <label class="wide">System prompt
+              <textarea id="system-prompt" rows="4" maxlength="20000"></textarea>
+            </label>
+            <div class="wide prompt-actions">
+              <span id="settings-note" class="muted"></span>
+              <button id="save-prompt" type="button" class="button small" disabled>Save prompt</button>
+            </div>
+          </div>
+        </details>
+
+        <ol id="transcript" class="transcript" aria-live="polite"></ol>
+
+        <footer class="controls">
+          <div class="state">
+            <span id="state-dot" class="dot" data-state="idle"></span>
+            <span id="status" role="status">Idle</span>
+          </div>
+          <button id="mute" type="button" class="button" aria-pressed="false" disabled>Mute</button>
+          <button id="call" type="button" class="button call">Call</button>
+        </footer>
+      </main>
+    </div>
+    <audio id="remote" autoplay></audio>
     <script src="app.js"></script>
   </body>
 </html>

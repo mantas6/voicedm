@@ -30,12 +30,15 @@ Open the page, press **Call** and talk. The first start downloads the Whisper mo
 into `VOICEDM_DATA_DIR`. Outside the dev shell, the binary wheels need `libstdc++` and
 `zlib` on `LD_LIBRARY_PATH`.
 
-A headless test call (speaks WAV files, can talk over the bot, records the reply):
+A headless test call (speaks WAV files, can talk over the bot, records the reply,
+then prints the session's stored messages; without `--session` it starts a new one):
 
 ```sh
-uv run python scripts/call_client.py --url http://localhost:8780 \
+uv run python scripts/call_client.py --url http://localhost:8780 --session 1 \
     --say question.wav --barge-in interrupt.wav --record reply.wav --duration 60
 ```
+
+Sessions and their messages are kept in `voicedm.db` in `VOICEDM_DATA_DIR`.
 
 Test and lint:
 
