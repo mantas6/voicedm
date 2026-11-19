@@ -26,6 +26,17 @@ uv run voicedm            # or: uv run python -m voicedm
 curl http://localhost:8780/api/health
 ```
 
+Open the page, press **Call** and talk. The first start downloads the Whisper model
+into `VOICEDM_DATA_DIR`. Outside the dev shell, the binary wheels need `libstdc++` and
+`zlib` on `LD_LIBRARY_PATH`.
+
+A headless test call (speaks WAV files, can talk over the bot, records the reply):
+
+```sh
+uv run python scripts/call_client.py --url http://localhost:8780 \
+    --say question.wav --barge-in interrupt.wav --record reply.wav --duration 60
+```
+
 Test and lint:
 
 ```sh

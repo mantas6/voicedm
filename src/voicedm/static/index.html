@@ -4,9 +4,15 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>voicedm</title>
+    <link rel="stylesheet" href="style.css">
   </head>
   <body>
-    <h1>voicedm</h1>
-    <p>Voice calls are not implemented yet. See <a href="/api/health">/api/health</a>.</p>
+    <main>
+      <h1>voicedm</h1>
+      <button id="call" type="button">Call</button>
+      <p id="status" role="status">Idle</p>
+      <audio id="remote" autoplay></audio>
+    </main>
+    <script src="app.js"></script>
   </body>
 </html>

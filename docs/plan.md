@@ -66,8 +66,11 @@ transport.input()
 - **Transport:** Pipecat `SmallWebRTCTransport`. The server exposes `POST /api/offer`
   for the SDP offer/answer. On a local network, host ICE candidates are enough; a STUN
   server URL is optional config.
-- **VAD / turns:** `SileroVADAnalyzer` with interruptions enabled. A smart-turn model is
-  a later improvement if the silence-based end-of-turn feels too eager or too slow.
+- **VAD / turns:** `SileroVADAnalyzer` (on the user context aggregator) with
+  interruptions enabled, and an explicit silence-based end of turn
+  (`SpeechTimeoutUserTurnStopStrategy`); Pipecat's default stop strategy is the
+  smart-turn model, which needs torch. Smart turn is a later improvement if the
+  silence-based end-of-turn feels too eager or too slow.
 - **STT:** Pipecat `WhisperSTTService` (faster-whisper), English-only model, CPU, `int8`.
   The default model is `base.en`; `small.en` is configurable if the CPU keeps up. The
   model is loaded once at startup.
@@ -76,16 +79,22 @@ transport.input()
   Ollama server's setting. If that becomes a problem, replace it with a small service on
   the native `/api/chat` endpoint.
 - **TTS:** a custom `ChatterboxTTSService` (about 50 lines). It requests `wav` for each
-  sentence, strips the header and yields 24 kHz mono PCM frames. Pipecat's sentence
+  sentence, parses the RIFF header and yields mono PCM frames at the server's rate
+  (24 kHz); Pipecat resamples if that differs from the pipeline's output rate. Pipecat's sentence
   aggregation feeds it text, so the TTS server does not need to stream.
   `OpenAITTSService` cannot be used as-is because it asks for raw `pcm`.
-- **Transcripts:** Pipecat's RTVI processor sends user and bot transcription events over
-  the WebRTC data channel, and the page shows them live.
+- **Transcripts:** Pipecat's RTVI processor (added by the pipeline worker by default)
+  sends user and bot transcription events over the WebRTC data channel, and the page
+  shows them live. The page opens the data channel and sends RTVI `client-ready`.
 - **Warm-up:** when a call connects, start a background no-op request to Ollama (load
   the selected model) and a one-word synthesis to Chatterbox, so the first real turn
-  does not pay the cold-start cost. The UI shows "warming up" until both answer.
+  does not pay the cold-start cost. The UI shows "warming up" until both answer: the
+  server sends RTVI `server-message`s `{"type": "warmup", "state": "warming"}` and then
+  `{"type": "warmup", "state": "done", "ollama": bool, "chatterbox": bool}`.
 - **Metrics:** enable Pipecat metrics and log time-to-first-byte per service (STT, LLM,
-  TTS) for each turn, to find where latency goes.
+  TTS) for each turn, to find where latency goes. A small observer also logs, per turn,
+  when the transcript, first LLM token, first TTS audio and LLM end happen relative to
+  the end of the user's speech.
 
 ### Settings and mid-call changes
 
@@ -93,9 +102,10 @@ Each session stores its own model, voice and system prompt. The UI can change th
 any time:
 
 - Between calls, the new values apply to the next call.
-- During a call, the server pushes Pipecat update-settings frames (LLM model, TTS voice)
-  into the running pipeline and replaces the system message in the context. These take
-  effect from the next turn.
+- During a call, the server pushes Pipecat update-settings frames (LLM model and system
+  instruction, TTS voice) into the running pipeline. These take effect from the next
+  turn. (The system prompt is the LLM service's `system_instruction` setting, not a
+  message in the context: Pipecat deprecates system messages in `LLMContext`.)
 
 The model list comes from Ollama `/api/tags` and the voice list from Chatterbox
 `/v1/audio/voices`. Both are proxied by the server so the browser only talks to voicedm.
@@ -237,6 +247,7 @@ src/voicedm/
   memory.py                context building and summarisation
   upstream.py              Ollama and Chatterbox listing, health, warm-up
   static/                  index.html, app.js, style.css
+scripts/call_client.py     headless test call against a running server
 tests/
 docs/
 ```
@@ -244,7 +255,9 @@ docs/
 ## Packaging and deployment
 
 - **Development:** `uv` for Python dependencies, a flake dev shell with Python, `uv`,
-  `ffmpeg` and `ruff`.
+  `ffmpeg` and `ruff`, and `LD_LIBRARY_PATH` set for the binary wheels (libstdc++,
+  zlib). `scripts/call_client.py` makes a headless test call (aiortc) against a running
+  server: it speaks WAV files, can barge in, and records and logs what comes back.
 - **Package:** built from `uv.lock` with uv2nix (pyproject-nix), so the NixOS service
   uses pinned dependencies. Binary wheels (onnxruntime for Silero, ctranslate2 for
   faster-whisper, aiortc) may need fix-ups such as `autoPatchelfHook`. If this takes too

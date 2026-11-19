@@ -1,6 +1,7 @@
 import asyncio
 
 import httpx
+from fakes import FakeBot
 from fastapi.testclient import TestClient
 
 from voicedm import upstream
@@ -11,7 +12,7 @@ CONFIG = Config(ollama_url="http://ollama.test", chatterbox_url="http://tts.test
 
 
 def client_for(handler) -> TestClient:
-    return TestClient(create_app(CONFIG, transport=httpx.MockTransport(handler)))
+    return TestClient(create_app(CONFIG, transport=httpx.MockTransport(handler), bot=FakeBot()))
 
 
 def get_health(handler) -> dict:

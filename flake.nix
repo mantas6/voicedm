@@ -30,6 +30,11 @@
             # Use the shell's Python instead of letting uv download one.
             UV_PYTHON = "${pkgs.python313}/bin/python3";
             UV_PYTHON_DOWNLOADS = "never";
+            # Binary wheels (av, onnxruntime, ctranslate2) link against these.
+            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
+              pkgs.stdenv.cc.cc.lib
+              pkgs.zlib
+            ];
           };
         };
       });
