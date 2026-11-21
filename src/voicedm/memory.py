@@ -42,6 +42,8 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.ollama.llm import OLLamaLLMService
 
+from voicedm.expressions import history_text
+
 if TYPE_CHECKING:
     from voicedm.storage import Storage
     from voicedm.upstream import Upstreams
@@ -208,12 +210,42 @@ class MemoryLLMService(OLLamaLLMService):
 
     The summary is kept as an appended system instruction, which Pipecat composes
     after the base system prompt and keeps when the prompt is changed mid-call.
+
+    With ``hide_actions``, the model is shown its earlier replies without their
+    actions (see ``expressions.history_text``), keeping the sound ones with
+    ``keep_sounds``. Only the request is changed, each time it is built: the context
+    keeps the replies as written, so folding, which matches it against the stored
+    messages, is not affected. Both may change mid-call.
     """
 
-    def __init__(self, *, summary: str = "", **kwargs) -> None:
+    def __init__(
+        self, *, summary: str = "", hide_actions: bool = False, keep_sounds: bool = False, **kwargs
+    ) -> None:
         super().__init__(**kwargs)
+        self.hide_actions = hide_actions
+        self.keep_sounds = keep_sounds
         self._summary_part = ""
         self.set_summary(summary)
+
+    def shown(self, messages: list) -> list:
+        """``messages`` as the model is given them."""
+        if not self.hide_actions:
+            return messages
+
+        def show(message: Any) -> Any:
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                return message
+            content = message.get("content")
+            if not isinstance(content, str):
+                return message
+            return {**message, "content": history_text(content, keep_sounds=self.keep_sounds)}
+
+        return [show(message) for message in messages]
+
+    def build_chat_completion_params(self, params_from_context: Any) -> dict:
+        params = super().build_chat_completion_params(params_from_context)
+        params["messages"] = self.shown(params["messages"])
+        return params
 
     def set_summary(self, summary: str) -> None:
         parts = self._appended_system_instructions

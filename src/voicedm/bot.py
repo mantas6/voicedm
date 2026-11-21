@@ -472,6 +472,9 @@ class Bot:
         # The system instruction is the session's system prompt plus its summary.
         llm = MemoryLLMService(
             summary=session["summary"],
+            # Actions that are not read aloud are not shown back to the model either.
+            hide_actions=session["silent_actions"],
+            keep_sounds=session["expressions"],
             base_url=f"{config.ollama_url}/v1",
             settings=OLLamaLLMService.Settings(
                 model=model, system_instruction=session["system_prompt"]
@@ -494,9 +497,15 @@ class Bot:
             ),
         )
         # Summarises with the call's current model, so no second model gets loaded.
-        summarise = ollama_summariser(
+        summarise_as_written = ollama_summariser(
             upstreams, lambda: llm.settings.model, config.summary_prompt, config.summary_timeout
         )
+
+        async def summarise(previous: str, messages: list[dict]) -> str:
+            # The summary is shown to the model too, so it is made from what the
+            # model is shown of the messages.
+            return await summarise_as_written(previous, llm.shown(messages))
+
         memory = CallMemory(store, session, context, llm, summarise, config.memory_budget)
 
         async def save_failed() -> None:
@@ -555,6 +564,10 @@ class Bot:
             for flag in ("expressions", "silent_actions"):
                 if flag in changes:
                     setattr(tts, flag, changes[flag])
+            if "silent_actions" in changes:
+                llm.hide_actions = changes["silent_actions"]
+            if "expressions" in changes:
+                llm.keep_sounds = changes["expressions"]
             frames = settings_frames(changes)
             if frames:
                 await worker.queue_frames(frames)

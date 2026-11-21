@@ -132,7 +132,8 @@ Each session stores its own model, voice, system prompt and how actions are spok
   instruction, TTS voice) into the running pipeline. These take effect from the next
   turn. (The system prompt is the LLM service's `system_instruction` setting, not a
   message in the context: Pipecat deprecates system messages in `LLMContext`.)
-  The two action settings switch from the next sentence.
+  The two action settings switch from the next sentence, and from the next LLM request
+  for what the model is shown of its earlier replies.
 
 The model list comes from Ollama `/api/tags` and the voice list from Chatterbox
 `/v1/audio/voices`. Both are proxied by the server so the browser only talks to voicedm.
@@ -182,13 +183,23 @@ spoken, so only this counts as an action:
 A single word inside a sentence (`that *looks* great`) is emphasis. Anything not
 recognised stays as it is and is read aloud; that is the safer mistake.
 
-As with sounds, only the request to Chatterbox changes: the transcript, the stored
-messages and the LLM context keep the reply as written. A sentence that is nothing but
-an action is "spoken" as a moment of silence instead of a request, so a reply made only
-of actions still counts as spoken and is kept.
+The transcript and the stored messages keep the reply as written. A sentence that is
+nothing but an action is "spoken" as a moment of silence instead of a request, so a
+reply made only of actions still counts as spoken and is kept.
 
 With both settings on, an action that names a sound becomes the sound whatever its
 length, and the other actions are silent.
+
+The model is not shown these actions in its own earlier replies either. A model copies
+what it sees itself having written: once a few replies open with the same action,
+every reply does (measured with a 12B roleplay model: 12 of 12 replies, against 0 of 12
+with the actions taken out of its history). So with `silent_actions` on, each LLM
+request, and each summarisation, gets the assistant messages without their actions.
+With `expressions` on as well, the short actions that name a sound stay, so the model
+goes on writing those. This is done where the request is built: the LLM context and
+the stored messages are not changed, which keeps the prompt prefix stable and leaves
+folding, which matches the context against the stored messages, as it was. A reply
+that was only actions is shown as written.
 
 ## Storage
 

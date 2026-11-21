@@ -98,6 +98,42 @@ def test_summary_goes_after_the_system_prompt():
     assert llm.settings.system_instruction == "Be brief."
 
 
+async def test_request_shows_earlier_replies_without_actions_when_asked():
+    """Through the real path from the context to the request, not only ``shown``."""
+    looks = "*looks at you with a smile*"
+    context = LLMContext(
+        messages=[
+            {"role": "user", "content": "Hi *there*"},
+            {"role": "assistant", "content": f"{looks} *laughs* Hello."},
+            {"role": "user", "content": "How are you?"},
+        ]
+    )
+
+    async def request(**flags) -> list[tuple[str, str]]:
+        llm = MemoryLLMService(
+            base_url="http://ollama.test/v1",
+            settings=MemoryLLMService.Settings(model="m", system_instruction="Be brief."),
+            **flags,
+        )
+        from_context = await llm.get_llm_adapter().get_llm_invocation_params(
+            context, system_instruction="Be brief.", convert_developer_to_user=True
+        )
+        params = llm.build_chat_completion_params(from_context)
+        return [(m["role"], m["content"]) for m in params["messages"]]
+
+    start = [("system", "Be brief."), ("user", "Hi *there*")]
+    end = [("user", "How are you?")]
+    assert await request() == [*start, ("assistant", f"{looks} *laughs* Hello."), *end]
+    assert await request(hide_actions=True) == [*start, ("assistant", "Hello."), *end]
+    assert await request(hide_actions=True, keep_sounds=True) == [
+        *start,
+        ("assistant", "*laughs* Hello."),
+        *end,
+    ]
+    # The context itself is never changed.
+    assert context.get_messages()[1]["content"] == f"{looks} *laughs* Hello."
+
+
 def test_summary_request_marks_interrupted_replies():
     history = [
         {"role": "user", "content": "Tell me a story", "interrupted": False},

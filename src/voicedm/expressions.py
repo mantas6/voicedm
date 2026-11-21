@@ -10,11 +10,15 @@ sent to Chatterbox, on request in two ways:
 
 Text between asterisks is not always an action: ``I *never* said that`` is emphasis and
 has to be spoken. Whatever is not recognised as an action is left exactly as it is.
+
+``history_text`` is the same idea for the model's own earlier replies: what it is shown
+of them, so that it does not keep repeating an action.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 
 # With actions read aloud, one longer than this many words says more than a sound and
 # is left alone. With actions silent, any action that names a sound becomes the sound.
@@ -150,31 +154,28 @@ def is_sound(span: str, before: str, after: str) -> bool:
     return len(words_of(span)) > 1 or not all(surroundings(before, after))
 
 
-def speech_text(text: str, *, sounds: bool = False, silent: bool = False) -> str:
-    """``text`` as it should be sent for speech.
+def rewrite(text: str, decide: Callable[[str, str, str], str | None]) -> str:
+    """``text`` with some of its spans between asterisks replaced or removed.
 
-    With ``sounds``, each action that names a Chatterbox sound is replaced by its tag;
-    with ``silent``, the other actions are removed. The rest of the text is unchanged.
+    ``decide(span, before, after)`` gives the replacement for a span, ``""`` to remove
+    it, or None to leave it. A removed span takes the space around it along, and the
+    punctuation that only belonged to it.
     """
     result = ""
     position = 0
     for match in ACTION.finditer(text):
-        span, around = match.group(1), (text[: match.start()], text[match.end() :])
-        tags: list[str] = []
-        if sounds and is_sound(span, *around):
-            tags = sound_tags(span, None if silent else MAX_SOUND_WORDS)
-        remove = not tags and silent and is_action(span, *around)
-        if not tags and not remove:
+        replacement = decide(match.group(1), text[: match.start()], text[match.end() :])
+        if replacement is None:
             continue
-        result += text[position : match.start()]
+        result += text[position : match.start()] + replacement
         position = match.end()
-        if tags:
-            result += " ".join(f"[{tag}]" for tag in tags)
+        if replacement:
             continue
-        # The action goes together with the space after it.
         while text[position : position + 1] in (" ", "\t"):
             position += 1
-        if text[position : position + 1] in tuple(PUNCTUATION):
+        if position == len(text):
+            result = result.rstrip()  # nothing follows: no space left behind
+        elif text[position : position + 1] in tuple(PUNCTUATION):
             head = result.rstrip()
             if head and head[-1] not in PUNCTUATION:
                 result = head  # "Fine *shrugs*." is "Fine."
@@ -183,6 +184,42 @@ def speech_text(text: str, *, sounds: bool = False, silent: bool = False) -> str
                 while text[position : position + 1] in (*PUNCTUATION, " ", "\t"):
                     position += 1
     return result + text[position:]
+
+
+def speech_text(text: str, *, sounds: bool = False, silent: bool = False) -> str:
+    """``text`` as it should be sent for speech.
+
+    With ``sounds``, each action that names a Chatterbox sound is replaced by its tag;
+    with ``silent``, the other actions are removed. The rest of the text is unchanged.
+    """
+
+    def decide(span: str, before: str, after: str) -> str | None:
+        if sounds and is_sound(span, before, after):
+            tags = sound_tags(span, None if silent else MAX_SOUND_WORDS)
+            if tags:
+                return " ".join(f"[{tag}]" for tag in tags)
+        return "" if silent and is_action(span, before, after) else None
+
+    return rewrite(text, decide)
+
+
+def history_text(text: str, *, keep_sounds: bool = False) -> str:
+    """An earlier reply as the model is shown it: without its actions.
+
+    A model copies what it sees itself having written, so an action it opened a few
+    replies with soon opens every reply. Without them in its history it has nothing
+    to copy. With ``keep_sounds``, the short actions that name a Chatterbox sound stay,
+    so that it goes on writing those. A reply that was nothing but actions is shown as
+    it was, since an empty message would be worse.
+    """
+
+    def decide(span: str, before: str, after: str) -> str | None:
+        if keep_sounds and is_sound(span, before, after) and sound_tags(span):
+            return None
+        return "" if is_action(span, before, after) else None
+
+    shown = rewrite(text, decide)
+    return shown if has_speech(shown) else text
 
 
 def has_speech(text: str) -> bool:

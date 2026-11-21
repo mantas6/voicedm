@@ -1,6 +1,6 @@
 import pytest
 
-from voicedm.expressions import has_speech, speech_text
+from voicedm.expressions import has_speech, history_text, speech_text
 
 
 @pytest.mark.parametrize(
@@ -85,17 +85,17 @@ def test_nothing_changes_unless_asked():
             "My work is going well.",
         ),
         ("I see. *her eyes light up* Tell me more.", "I see. Tell me more."),
-        ("That's all. *leans back in the chair*", "That's all. "),
+        ("That's all. *leans back in the chair*", "That's all."),
         # Shorter, with a verb that actions are made of.
         ("*smiles* Hello.", "Hello."),
         ("*nods slowly* Yes.", "Yes."),
         ("*looks away* Maybe.", "Maybe."),
         ("Okay. *grinning widely* Let's go.", "Okay. Let's go."),
         ("Well, *shrugs* I guess so.", "Well, I guess so."),
-        ("Sure thing *winks*", "Sure thing "),
+        ("Sure thing *winks*", "Sure thing"),
         ("*nodding* Right.", "Right."),
         ("*sigh* Fine.", "Fine."),
-        ("Okay. *wink*", "Okay. "),
+        ("Okay. *wink*", "Okay."),
         # The punctuation around a removed action.
         ("Fine *shrugs*.", "Fine."),
         ("*smiles*. Hello.", "Hello."),
@@ -136,7 +136,7 @@ def test_emphasis_is_still_spoken(said):
 @pytest.mark.parametrize(
     ("said", "spoken"),
     [
-        ("*laughs* Good one. *smiles*", "[laugh] Good one. "),
+        ("*laughs* Good one. *smiles*", "[laugh] Good one."),
         ("*smiles* Sure. *sighs*", "Sure. [sigh]"),
         # A long action is silent anyway, so the sound it names can be heard.
         ("*looks at you and laughs softly at the idea* No.", "[laugh] No."),
@@ -159,3 +159,37 @@ def test_long_action_naming_a_sound_is_read_out_when_actions_are_not_silent():
 )
 def test_has_speech(text, expected):
     assert has_speech(text) is expected
+
+
+LOOKS = "*looks at you with a mix of amusement and a bit of pride*"
+
+
+@pytest.mark.parametrize(
+    ("written", "shown"),
+    [
+        (f"{LOOKS} My work is going well.", "My work is going well."),
+        ("*smiles* Hello. *nods*", "Hello."),
+        ("*laughs* Good one.", "Good one."),
+        ("I *never* said that.", "I *never* said that."),
+        ("No actions here.", "No actions here."),
+        # Nothing but actions: shown as written rather than as an empty reply.
+        (LOOKS, LOOKS),
+        ("*nods* *smiles*", "*nods* *smiles*"),
+    ],
+)
+def test_history_is_shown_without_actions(written, shown):
+    assert history_text(written) == shown
+
+
+@pytest.mark.parametrize(
+    ("written", "shown"),
+    [
+        (f"{LOOKS} *laughs* Good one. *smiles*", "*laughs* Good one."),
+        ("*sighs softly* Fine. *shrugs*", "*sighs softly* Fine."),
+        # A long action is narration even when it names a sound.
+        ("*looks at you and laughs softly at the idea* No.", "No."),
+        ("*laughs*", "*laughs*"),
+    ],
+)
+def test_history_can_keep_the_sound_actions(written, shown):
+    assert history_text(written, keep_sounds=True) == shown

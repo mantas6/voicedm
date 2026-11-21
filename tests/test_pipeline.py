@@ -70,7 +70,7 @@ class ScriptedLLM(MemoryLLMService):
             {
                 "model": self.settings.model,
                 "system": self.settings.system_instruction,
-                "messages": [dict(m) for m in context.get_messages()],
+                "messages": self.shown([dict(m) for m in context.get_messages()]),
             }
         )
         for chunk in self.replies.pop(0):
@@ -132,6 +132,8 @@ class Call:
         self.llm = ScriptedLLM(
             replies,
             summary=session["summary"],
+            hide_actions=session["silent_actions"],
+            keep_sounds=session["expressions"],
             settings=OLLamaLLMService.Settings(
                 model=session["model"], system_instruction=session["system_prompt"]
             ),
@@ -428,6 +430,59 @@ async def test_replies_that_are_only_an_action_stay_in_the_history(store):
     assert call.reports == []
     assert call.gave_up == []
     assert call.tts.is_usable
+
+
+def contents(request: dict) -> list[str]:
+    return [m["content"] for m in request["messages"]]
+
+
+async def test_the_model_is_not_shown_its_silent_actions(store):
+    session = await store.create_session("model-a", "Alpha.wav", "", silent_actions=True)
+    earlier = [
+        await store.add_message(session["id"], "user", "Hi"),
+        await store.add_message(session["id"], "assistant", f"{LOOKS} Hello. *laughs*"),
+    ]
+    replies = [[LOOKS, " Going well."], ["Good."]]
+    async with Call(store, session, earlier, replies) as call:
+        await call.say("How is work?")
+        await call.wait_for_messages(4)
+        await call.say("And you?")
+        messages = await call.wait_for_messages(6)
+    # From the stored history, and from the reply given during this call.
+    assert contents(call.llm.requests[0]) == ["Hi", "Hello.", "How is work?"]
+    assert contents(call.llm.requests[1])[3:] == ["Going well.", "And you?"]
+    # The history itself keeps the replies as written.
+    assert [m["content"] for m in messages][1::2] == [
+        f"{LOOKS} Hello. *laughs*",
+        f"{LOOKS} Going well.",
+        "Good.",
+    ]
+
+
+async def test_the_model_is_still_shown_sound_actions_when_they_are_voiced(store):
+    session = await store.create_session(
+        "model-a", "Alpha.wav", "", expressions=True, silent_actions=True
+    )
+    earlier = [
+        await store.add_message(session["id"], "user", "Hi"),
+        await store.add_message(session["id"], "assistant", f"{LOOKS} *laughs* Hello."),
+    ]
+    async with Call(store, session, earlier, [["Fine."]]) as call:
+        await call.say("How are you?")
+        await call.wait_for_messages(4)
+    assert contents(call.llm.requests[0]) == ["Hi", "*laughs* Hello.", "How are you?"]
+
+
+async def test_the_model_is_shown_actions_that_are_read_aloud(store):
+    session = await store.create_session("model-a", "Alpha.wav", "")
+    earlier = [
+        await store.add_message(session["id"], "user", "Hi"),
+        await store.add_message(session["id"], "assistant", f"{LOOKS} Hello."),
+    ]
+    async with Call(store, session, earlier, [["Fine."]]) as call:
+        await call.say("How are you?")
+        await call.wait_for_messages(4)
+    assert contents(call.llm.requests[0]) == ["Hi", f"{LOOKS} Hello.", "How are you?"]
 
 
 async def test_silent_actions_and_sounds_together(store):
