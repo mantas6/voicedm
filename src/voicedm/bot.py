@@ -483,6 +483,7 @@ class Bot:
             client=upstreams.client,
             timeout=config.tts_timeout,
             expressions=session["expressions"],
+            silent_actions=session["silent_actions"],
         )
         aggregators = LLMContextAggregatorPair(
             context,
@@ -551,8 +552,9 @@ class Bot:
 
         async def update_settings(changes: dict[str, Any]) -> None:
             logger.info(f"Call {pc_id}: settings changed: {sorted(changes)}")
-            if "expressions" in changes:
-                tts.expressions = changes["expressions"]
+            for flag in ("expressions", "silent_actions"):
+                if flag in changes:
+                    setattr(tts, flag, changes[flag])
             frames = settings_frames(changes)
             if frames:
                 await worker.queue_frames(frames)

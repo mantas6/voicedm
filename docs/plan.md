@@ -124,15 +124,15 @@ transport.input()
 
 ### Settings and mid-call changes
 
-Each session stores its own model, voice, system prompt and whether actions are voiced
-as sounds (below). The UI can change them at any time:
+Each session stores its own model, voice, system prompt and how actions are spoken
+(below). The UI can change them at any time:
 
 - Between calls, the new values apply to the next call.
 - During a call, the server pushes Pipecat update-settings frames (LLM model and system
   instruction, TTS voice) into the running pipeline. These take effect from the next
   turn. (The system prompt is the LLM service's `system_instruction` setting, not a
   message in the context: Pipecat deprecates system messages in `LLMContext`.)
-  Voicing actions as sounds switches from the next sentence.
+  The two action settings switch from the next sentence.
 
 The model list comes from Ollama `/api/tags` and the voice list from Chatterbox
 `/v1/audio/voices`. Both are proxied by the server so the browser only talks to voicedm.
@@ -164,6 +164,32 @@ Chatterbox has each such action replaced by its tag:
 With another Chatterbox model the tags are read aloud as words, so the setting is only
 useful with Turbo.
 
+### Silent actions
+
+Models that write actions often write long ones (`*looks at you with a smile*`), which
+are read aloud as words too. With the session's `silent_actions` setting on (off by
+default), actions are left out of the text sent to Chatterbox.
+
+Text between asterisks can also be emphasis (`I *never* said that`), which has to be
+spoken, so only this counts as an action:
+
+- four or more words between the asterisks;
+- fewer, with a verb from a built-in list of common actions in its `-s` or `-ing` form
+  (`*smiles*`, `*nods slowly*`, `*looking away*`);
+- a single listed verb in its plain form when it stands apart from the sentence
+  (`*sigh* Fine.`, but not `*Look* at me`).
+
+A single word inside a sentence (`that *looks* great`) is emphasis. Anything not
+recognised stays as it is and is read aloud; that is the safer mistake.
+
+As with sounds, only the request to Chatterbox changes: the transcript, the stored
+messages and the LLM context keep the reply as written. A sentence that is nothing but
+an action is "spoken" as a moment of silence instead of a request, so a reply made only
+of actions still counts as spoken and is kept.
+
+With both settings on, an action that names a sound becomes the sound whatever its
+length, and the other actions are silent.
+
 ## Storage
 
 SQLite in the service's state directory (`voicedm.db` in `VOICEDM_DATA_DIR`), WAL mode.
@@ -180,7 +206,8 @@ sessions (
   system_prompt TEXT NOT NULL,
   summary       TEXT NOT NULL DEFAULT '',
   summary_upto  INTEGER,         -- last message id folded into the summary
-  expressions   INTEGER NOT NULL DEFAULT 0  -- voice actions such as *laughs* as sounds
+  expressions   INTEGER NOT NULL DEFAULT 0,    -- voice actions such as *laughs* as sounds
+  silent_actions INTEGER NOT NULL DEFAULT 0    -- leave the other actions out of the speech
 )
 
 messages (
@@ -282,7 +309,7 @@ The budget and the summary prompt are config values, so they can be tuned per mo
 | `GET` | `/api/sessions` | List sessions |
 | `POST` | `/api/sessions` | New session (copies the current settings; body `{"copy_from": id}` optional) |
 | `GET` | `/api/sessions/{id}` | Session with settings and messages |
-| `PATCH` | `/api/sessions/{id}` | Change model, voice, system prompt, `expressions` or title |
+| `PATCH` | `/api/sessions/{id}` | Change model, voice, system prompt, `expressions`, `silent_actions` or title |
 | `DELETE` | `/api/sessions/{id}` | Delete the session and its messages; 409 while it is in a call |
 | `POST` | `/api/offer` | WebRTC offer/answer for a call on a session (`session_id` in the body) |
 | `GET` | `/api/health` | Liveness, plus reachability of Ollama and Chatterbox |
@@ -310,8 +337,8 @@ can switch to Pipecat's JS client SDK vendored as ES modules.
 
 - Session list, new session, and deleting a session after a confirmation dialog.
   Deleting the last session leaves a new empty one with the same settings.
-- Model, voice, system prompt and "voice actions as sounds" controls for the current
-  session.
+- Model, voice, system prompt and the two action controls ("voice actions as sounds",
+  "don't read actions aloud") for the current session.
 - Call / Hang up button with state: connecting, warming up, listening, thinking,
   speaking.
 - Live transcript, plus history loaded from the API. The bot's reply shows as the LLM
@@ -384,7 +411,7 @@ src/voicedm/
   app.py                   FastAPI routes, static files
   bot.py                   Pipecat pipeline per call
   tts_chatterbox.py
-  expressions.py           actions such as *laughs* to Chatterbox sound tags
+  expressions.py           actions between asterisks: sound tags, silent actions
   storage.py               SQLite access and migrations
   memory.py                prompt layout, summary folding
   upstream.py              Ollama and Chatterbox listing, health, warm-up

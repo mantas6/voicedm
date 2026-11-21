@@ -72,9 +72,14 @@ MIGRATIONS: list[str] = [
     """
     ALTER TABLE sessions ADD COLUMN expressions INTEGER NOT NULL DEFAULT 0;
     """,
+    # Whether the other actions are left out of the speech.
+    """
+    ALTER TABLE sessions ADD COLUMN silent_actions INTEGER NOT NULL DEFAULT 0;
+    """,
 ]
 
-SESSION_FIELDS = ("title", "model", "voice", "system_prompt", "expressions")
+SESSION_FIELDS = ("title", "model", "voice", "system_prompt", "expressions", "silent_actions")
+FLAGS = ("expressions", "silent_actions")
 
 
 def now() -> str:
@@ -91,7 +96,7 @@ def auto_title(text: str) -> str:
 
 
 def session_from(row: sqlite3.Row) -> dict:
-    return {**dict(row), "expressions": bool(row["expressions"])}
+    return {**dict(row), **{flag: bool(row[flag]) for flag in FLAGS}}
 
 
 def migrate(conn: sqlite3.Connection) -> int:
@@ -150,14 +155,13 @@ class Storage:
         return session_from(row) if row else None
 
     def _create_session(
-        self, model: str, voice: str, system_prompt: str, expressions: bool
+        self, model: str, voice: str, system_prompt: str, expressions: bool, silent_actions: bool
     ) -> dict:
         stamp = now()
         cursor = self._conn.execute(
-            "INSERT INTO sessions"
-            " (created_at, updated_at, model, voice, system_prompt, expressions)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (stamp, stamp, model, voice, system_prompt, int(expressions)),
+            "INSERT INTO sessions (created_at, updated_at, model, voice, system_prompt,"
+            " expressions, silent_actions) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (stamp, stamp, model, voice, system_prompt, int(expressions), int(silent_actions)),
         )
         return self._get_session(cursor.lastrowid)
 
@@ -202,13 +206,21 @@ class Storage:
         return await self._run(latest)
 
     async def create_session(
-        self, model: str, voice: str, system_prompt: str, *, expressions: bool = False
+        self,
+        model: str,
+        voice: str,
+        system_prompt: str,
+        *,
+        expressions: bool = False,
+        silent_actions: bool = False,
     ) -> dict:
-        return await self._run(self._create_session, model, voice, system_prompt, expressions)
+        return await self._run(
+            self._create_session, model, voice, system_prompt, expressions, silent_actions
+        )
 
     async def update_session(self, session_id: int, **changes: Any) -> dict | None:
-        """Change some of title, model, voice, system prompt and expressions. None if no
-        such session."""
+        """Change some of title, model, voice, system prompt and the two action flags.
+        None if no such session."""
         return await self._run(self._update_session, session_id, changes)
 
     async def delete_session(self, session_id: int) -> bool:

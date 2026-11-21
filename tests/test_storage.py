@@ -22,7 +22,7 @@ def test_fresh_database_gets_the_schema(tmp_path):
     columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
     assert columns == {
         "id", "title", "created_at", "updated_at", "model", "voice", "system_prompt",
-        "summary", "summary_upto", "expressions",
+        "summary", "summary_upto", "expressions", "silent_actions",
     }  # fmt: skip
     columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
     assert columns == {
@@ -161,6 +161,16 @@ async def test_expressions_are_off_unless_set_and_read_back_as_a_flag(store):
     assert (await store.update_session(plain["id"], expressions=False))["expressions"] is False
 
 
+async def test_silent_actions_are_off_unless_set_and_separate_from_expressions(store):
+    plain = await store.create_session("m", "v", "p")
+    assert plain["silent_actions"] is False
+    silent = await store.create_session("m", "v", "p", silent_actions=True)
+    assert (silent["silent_actions"], silent["expressions"]) == (True, False)
+    updated = await store.update_session(plain["id"], silent_actions=True)
+    assert (updated["silent_actions"], updated["expressions"]) == (True, False)
+    assert (await store.get_session(plain["id"]))["silent_actions"] is True
+
+
 async def test_summary_and_messages_after_it(store):
     session = await store.create_session("m", "v", "p")
     sid = session["id"]
@@ -230,7 +240,8 @@ def test_version_1_database_is_rebuilt_with_its_data(tmp_path, monkeypatch):
     assert s.version == len(MIGRATIONS)
     conn = sqlite3.connect(path)
     assert conn.execute(f"SELECT {columns} FROM sessions ORDER BY id").fetchall() == before
-    assert conn.execute("SELECT DISTINCT expressions FROM sessions").fetchall() == [(0,)]
+    flags = "SELECT DISTINCT expressions, silent_actions FROM sessions"
+    assert conn.execute(flags).fetchall() == [(0, 0)]
     assert conn.execute("SELECT id, session_id FROM messages ORDER BY id").fetchall() == [
         (1, 1),
         (2, 5),

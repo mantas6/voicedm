@@ -41,17 +41,18 @@ def test_new_session_copies_the_latest_session_settings():
                 "voice": "Beta.wav",
                 "system_prompt": "Be terse.",
                 "expressions": True,
+                "silent_actions": True,
             },
         )
         second = client.post("/api/sessions").json()
-    assert first["expressions"] is False  # off until switched on
+    assert (first["expressions"], first["silent_actions"]) == (False, False)  # until set
     assert second["id"] != first["id"]
     assert (second["model"], second["voice"], second["system_prompt"]) == (
         "second-model:7b",
         "Beta.wav",
         "Be terse.",
     )
-    assert second["expressions"] is True
+    assert (second["expressions"], second["silent_actions"]) == (True, True)
 
 
 def test_new_session_copies_a_named_session():
@@ -133,6 +134,17 @@ def test_patch_switches_expressions():
         assert off.json()["expressions"] is False
 
 
+def test_patch_switches_silent_actions_on_its_own():
+    with client_for() as client:
+        sid = client.post("/api/sessions").json()["id"]
+        on = client.patch(f"/api/sessions/{sid}", json={"silent_actions": True})
+        assert on.status_code == 200
+        assert (on.json()["silent_actions"], on.json()["expressions"]) == (True, False)
+        assert client.get(f"/api/sessions/{sid}").json()["silent_actions"] is True
+        off = client.patch(f"/api/sessions/{sid}", json={"silent_actions": False})
+        assert off.json()["silent_actions"] is False
+
+
 def test_patch_rejects_bad_fields():
     with client_for() as client:
         sid = client.post("/api/sessions").json()["id"]
@@ -148,6 +160,8 @@ def test_patch_rejects_bad_fields():
             {"expressions": None},
             {"expressions": "yes"},
             {"expressions": 1},
+            {"silent_actions": None},
+            {"silent_actions": "yes"},
         ):
             assert client.patch(f"/api/sessions/{sid}", json=body).status_code == 422, body
 

@@ -142,6 +142,7 @@ class Call:
             client=self.http,
             timeout=2,
             expressions=session["expressions"],
+            silent_actions=session["silent_actions"],
         )
         self.context = LLMContext(messages=build_context(session, history))
         self.memory = CallMemory(
@@ -391,6 +392,54 @@ async def test_expressions_can_be_switched_during_a_call(store):
         await call.say("Second")
         await call.wait_for_messages(4)
     assert [r["input"].strip() for r in call.tts_requests] == ["*sighs* One.", "[sigh] Two."]
+
+
+LOOKS = "*looks at you with a mix of amusement and a bit of pride*"
+
+
+async def test_silent_actions_are_not_spoken_but_kept_as_written(store):
+    session = await store.create_session("model-a", "Alpha.wav", "", silent_actions=True)
+    reply = [LOOKS, " My work is", " going well.", " *smiles*", " I *really* enjoy it."]
+    async with Call(store, session, [], [reply]) as call:
+        await call.say("How is work?")
+        messages = await call.wait_for_messages(2)
+    spoken = " ".join(r["input"].strip() for r in call.tts_requests)
+    assert spoken == "My work is going well. I *really* enjoy it."
+    assert messages[1]["content"] == f"{LOOKS} My work is going well. *smiles* I *really* enjoy it."
+    assert not messages[1]["interrupted"]
+
+
+async def test_replies_that_are_only_an_action_stay_in_the_history(store):
+    """Nothing is sent to the voice server for them, and that is not a failure."""
+    session = await store.create_session("model-a", "Alpha.wav", "", silent_actions=True)
+    replies = [["*nods*"], ["*smiles warmly*"], [LOOKS], ["*shrugs*"], ["Fine."]]
+    async with Call(store, session, [], replies) as call:
+        for turn in range(len(replies)):
+            await call.say(f"Turn {turn}")
+            messages = await call.wait_for_messages(2 * (turn + 1))
+    assert [m["content"] for m in messages if m["role"] == "assistant"] == [
+        "*nods*",
+        "*smiles warmly*",
+        LOOKS,
+        "*shrugs*",
+        "Fine.",
+    ]
+    assert [r["input"].strip() for r in call.tts_requests] == ["Fine."]
+    assert call.reports == []
+    assert call.gave_up == []
+    assert call.tts.is_usable
+
+
+async def test_silent_actions_and_sounds_together(store):
+    session = await store.create_session(
+        "model-a", "Alpha.wav", "", expressions=True, silent_actions=True
+    )
+    reply = ["*laughs*", " Good one.", " *leans back in the chair*", " Go on."]
+    async with Call(store, session, [], [reply]) as call:
+        await call.say("Joke")
+        await call.wait_for_messages(2)
+    spoken = " ".join(r["input"].strip() for r in call.tts_requests)
+    assert spoken == "[laugh] Good one. Go on."
 
 
 def test_settings_frames_only_for_changed_services():

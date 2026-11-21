@@ -188,6 +188,8 @@ class SessionPatch(BaseModel):
     system_prompt: str = Field(default=None, max_length=20000)
     # Voice actions such as *laughs* as sounds instead of reading them out.
     expressions: StrictBool = Field(default=None)
+    # Leave the other actions out of the speech.
+    silent_actions: StrictBool = Field(default=None)
 
 
 def create_app(
@@ -286,10 +288,10 @@ def create_app(
             source = await existing_session(request, body.copy_from)
         else:
             source = await store.latest_session()
-        expressions = False
+        flags = {"expressions": False, "silent_actions": False}
         if source:
             model, voice, prompt = source["model"], source["voice"], source["system_prompt"]
-            expressions = source["expressions"]
+            flags = {name: source[name] for name in flags}
         else:
             upstreams = upstreams_of(request)
             try:
@@ -301,7 +303,7 @@ def create_app(
             except UpstreamError as e:
                 raise HTTPException(status_code=503, detail=explain(e, CHATTERBOX)) from e
             prompt = DEFAULT_SYSTEM_PROMPT
-        session = await store.create_session(model, voice, prompt, expressions=expressions)
+        session = await store.create_session(model, voice, prompt, **flags)
         return {**with_call_state(session), "messages": []}
 
     @app.get("/api/sessions/{session_id}")
